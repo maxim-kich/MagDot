@@ -2,8 +2,9 @@
 
 MagSafe 3 as a T3 Code activity light. Experimental macOS Apple Silicon utility, GPL-3.0-only.
 
-- **Working:** green / amber, 750 ms per phase.
-- **Finished:** green / off, 750 ms per phase; T3 completion lasts 15 seconds.
+- **Working:** green / amber, 1 second per phase.
+- **Finished:** green / off, 1 second green, 1.5 seconds off; up to two minutes, dismissed when T3 records a visit to the completed chat.
+- **Attention:** amber for 1 second, off for 1.5 seconds while T3 has unresolved user input or approval. Takes priority over working.
 - **Idle:** return LED control to macOS.
 
 ## Build and run
@@ -16,6 +17,7 @@ build/magdot read
 sudo build/magdot demo 20
 sudo build/magdot working 20
 sudo build/magdot finished 20
+sudo build/magdot attention 20
 sudo build/magdot idle
 osacompile -o MagDot.app scripts/start.applescript
 open MagDot.app
@@ -25,7 +27,7 @@ Keep the app in this checkout. It is a small native AppleScript launcher, not ye
 
 ## T3 integration
 
-`scripts/t3-watch.py` opens `~/.t3/userdata/statev2.sqlite` **read-only** and queries `orchestration_v2_projection_provider_turns`. No prompts, messages, tokens, or credentials are read. Any running turn under one hour takes priority across local T3 threads. An observed running → completed transition blinks green for 15 seconds. Cancellation/failure returns idle. Old completions at startup do not trigger a blink.
+`scripts/t3-watch.py` opens `~/.t3/userdata/statev2.sqlite` **read-only** and queries `orchestration_v2_projection_provider_turns`. Request metadata and per-thread visit timestamps are also read. No prompts, messages, tokens, or credentials are read. Unresolved user input/approval takes priority, followed by running turns under one hour across local T3 threads. An observed running → completed transition blinks green for up to 120 seconds, ending when that thread's `lastVisitedAt` reaches its completion timestamp. Cancellation/failure returns idle. Old completions at startup do not trigger a blink.
 
 This is an experimental adapter to T3's internal schema, not a supported public lifecycle API. Schema errors return idle. A hung turn expires after one hour; suspended turns may remain working until that limit. A four-second state lease restores idle if the watcher stops. State is local under `~/.magdot`, outside the repository.
 
@@ -44,3 +46,5 @@ To stop: terminate the `magdot watch` process and `t3-watch.py` process using Ac
 Protocol reference: [MagHue SMC.swift](https://github.com/kamenlevi/MagHue/blob/main/Sources/MagHueCore/SMC.swift), licensed GPL-3.0; [JuiceLeft LED controller](https://github.com/Weta-Technologies/JuiceLeft/blob/main/juiceleft-led.c) documents the restoration latch caveat. MagDot uses GPL-3.0-only and restricts the protocol to ACLC values 0, 1, 3, 4.
 
 On the development Mac, compilation with `-Wall -Wextra -Werror` passed, ACLC reads and privileged writes succeeded, and the user visually confirmed the bounded demo's green/amber then green/off patterns. Restoration returned to firmware amber. Crash recovery, competing apps, and physical disconnect/reconnect still need dedicated hardware tests. No machine logs are committed.
+
+Lifecycle tests: `python3 -m unittest discover -s tests`. Covers completion expiry, visit dismissal, attention priority, cancellation, and startup suppression. Visit dismissal follows T3 persisted state; it does not independently inspect the foreground window. Updated slower timings and amber attention still require visual confirmation.

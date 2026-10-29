@@ -30,7 +30,7 @@ static void restore(void) {
  led(color); usleep(300000); if(led(0)==0)fprintf(stderr,"Restored ACLC=0 (system)\n");
 }
 int main(int argc,char **argv) {
- if(argc<2 || argc>3 || (strcmp(argv[1],"read")&&strcmp(argv[1],"idle")&&strcmp(argv[1],"working")&&strcmp(argv[1],"finished")&&strcmp(argv[1],"demo")&&strcmp(argv[1],"watch"))) { fprintf(stderr,"usage: magdot read|idle|working|finished|demo [seconds 1..3600] | watch STATE_FILE\n"); return 64; }
+ if(argc<2 || argc>3 || (strcmp(argv[1],"read")&&strcmp(argv[1],"idle")&&strcmp(argv[1],"working")&&strcmp(argv[1],"finished")&&strcmp(argv[1],"demo")&&strcmp(argv[1],"watch")&&strcmp(argv[1],"attention"))) { fprintf(stderr,"usage: magdot read|idle|working|finished|attention|demo [seconds 1..3600] | watch STATE_FILE\n"); return 64; }
  int watching=!strcmp(argv[1],"watch"); if(watching && argc!=3)return 64;
  char *end=NULL; long duration=(!watching && argc==3)?strtol(argv[2],&end,10):20;
  if(end && (*end || end==argv[2]))return 64;
@@ -47,27 +47,32 @@ int main(int argc,char **argv) {
  if(!guardian){ close(pipefd[1]); IOServiceClose(connection); if(connectSMC())_exit(1); struct pollfd p={pipefd[0],POLLIN,0}; char c; while(poll(&p,1,3000)>0 && read(pipefd[0],&c,1)==1){} restore(); _exit(0); }
  close(pipefd[0]); signal(SIGINT,stop);signal(SIGTERM,stop);signal(SIGHUP,stop);signal(SIGPIPE,SIG_IGN);
  int previous=initial,failed=0;
- for(int phase=0;!stopped && phase*0.75<seconds;phase++){
+ struct timespec start,nowtime;clock_gettime(CLOCK_MONOTONIC,&start);
+ for(int phase=0;!stopped;phase++){
+  clock_gettime(CLOCK_MONOTONIC,&nowtime);
+  double elapsed=nowtime.tv_sec-start.tv_sec+(nowtime.tv_nsec-start.tv_nsec)/1e9;
+  if(elapsed>=seconds)break;
   if(watching) {
    char state[16]={0}; long expiry=0; FILE *f=fopen(argv[2],"r");
    if(f){if(fscanf(f,"%15s %ld",state,&expiry)!=2)expiry=0;fclose(f);}
    long now=time(NULL);
-   int mode=(expiry>=now && expiry<=now+10)?(!strcmp(state,"working")?1:!strcmp(state,"finished")?2:0):0;
+   int mode=(expiry>=now && expiry<=now+10)?(!strcmp(state,"working")?1:!strcmp(state,"finished")?2:!strcmp(state,"attention")?3:0):0;
    if(!mode){if(previous!=0){restore();previous=0;} if(write(pipefd[1],".",1)!=1)break;usleep(750000);continue;}
    if(previous==0)previous=led(-1);
    else if(led(-1)!=previous){fprintf(stderr,"LED ownership changed; stopping\n");failed=1;break;}
    // The state file carries only a bounded enum, never executable input.
    seconds=3600;
-   int value=phase%2?(mode==2?1:4):3;
+   int value=phase%2?(mode==1?4:1):(mode==3?4:3);
    if(led(value)){failed=1;break;}previous=value;
-   if(write(pipefd[1],".",1)!=1)break;usleep(750000);continue;
+   if(write(pipefd[1],".",1)!=1)break;usleep(mode!=1 && phase%2?1500000:1000000);continue;
   }
   int current=led(-1); if(current!=previous){fprintf(stderr,"LED ownership changed; stopping\n");failed=1;break;}
-  int finished=!strcmp(argv[1],"finished")||(!strcmp(argv[1],"demo")&&phase*0.75>=seconds/2.0);
-  int value=phase%2?(finished?1:4):3;
+  int finished=!strcmp(argv[1],"finished")||(!strcmp(argv[1],"demo")&&elapsed>=seconds/2.0);
+  int attention=!strcmp(argv[1],"attention");
+  int value=phase%2?(finished||attention?1:4):(attention?4:3);
   if(led(value)){failed=1;break;} previous=value;
   printf("ACLC write=%d readback=%d\n",value,led(-1));fflush(stdout);
-  if(write(pipefd[1],".",1)!=1){failed=1;break;} usleep(750000);
+  if(write(pipefd[1],".",1)!=1){failed=1;break;} usleep((finished||attention) && phase%2?1500000:1000000);
  }
  close(pipefd[1]);waitpid(guardian,NULL,0);IOServiceClose(connection);return failed;
 }
