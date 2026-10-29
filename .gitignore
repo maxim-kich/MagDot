@@ -1,0 +1,4 @@
+build/
+*.log
+MagDot.app/
+__pycache__/
