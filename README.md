@@ -1,15 +1,54 @@
+<p align="center"><img src="assets/app-icon-transparent.png" width="128" alt="MagDot icon"></p>
+
 # MagDot
 
-MagSafe 3 as a T3 Code activity light. Experimental macOS Apple Silicon utility, GPL-3.0-only.
+A small native macOS menu-bar app that uses the official MagSafe 3 connector LED for local T3 Code activity. Apple Silicon, macOS 14 or later. GPL-3.0-only.
 
-- **Working:** green / amber, 1 second per phase.
-- **Finished:** green / off, 1 second green, 1.5 seconds off; up to two minutes, dismissed when T3 records a visit to the completed chat.
-- **Attention:** amber for 1 second, off for 1.5 seconds while T3 has unresolved user input or approval. Takes priority over working.
-- **Idle:** return LED control to macOS.
+MagDot currently works exclusively with **T3 Code agents**. Contributions are welcome—help add integrations with other agents. See [Contributing](CONTRIBUTING.md).
 
-## Build and run
+## Controls
 
-Requires macOS developer command-line tools and Python 3 (provided with Xcode tools).
+- **Activate:** a single on/off switch in the menu and General settings. MagDot activates automatically when opened with MagSafe connected.
+- **Deactivate:** restore macOS LED control and close the session.
+- **Quit:** wait for restoration acknowledgement before exiting.
+
+A missing/unreadable T3 database produces idle, not a simulated activity pattern.
+
+| State | LED | Duration |
+|---|---|---|
+| Working | Green 1 s / amber 1 s | While a recent turn is running |
+| Finished | Green ~0.67 s / off ~1 s | Forever by default; optional timer, or acknowledgement in the foreground T3 chat |
+| Needs input | Amber 1 s / off 1.5 s | While a matching unresolved request exists |
+| Idle | macOS controls the LED | Until new activity |
+
+Attention takes priority over finished, which takes priority over working. Colors switch discretely; brightness dimming is not supported by this implementation.
+
+## Installation and privilege model
+
+The app bundles a native controller and SQLite reader. Python and a source checkout are not runtime dependencies.
+
+A release needs Developer ID signing and Apple notarization before the `SMAppService` launch daemon can be installed normally. First launch registers the bundled helper and may require one-time approval in **System Settings → General → Login Items & Extensions**. Once approved, Start/Stop/Quit use local IPC without `osascript` or repeated administrator prompts.
+
+The root helper is socket-activated: macOS starts it when MagDot connects, and it exits after the LED session is restored. It has no KeepAlive job and does not stay running after Quit. It accepts only the MagDot app identifier signed by the same Apple signing team as the helper; the peer is identified using its kernel audit token. No sudoers rules, SIP changes, charging limits, or network services are used.
+
+Quit the app before upgrading, unregistering, or disabling its helper in System Settings. A changed helper may require unregistering and registering again, as required by Service Management. To remove the registered helper before deleting the app:
+
+```sh
+/Applications/MagDot.app/Contents/MacOS/MagDot --unregister-helper
+```
+
+## Build locally
+
+Requires Xcode command-line tools. `SIGN_IDENTITY` is a signing identity name from your own Keychain, not a secret.
+
+```sh
+SIGN_IDENTITY='Developer ID Application: Your Name (TEAMID)' scripts/build-app.sh
+open build/MagDot.app
+```
+
+Without `SIGN_IDENTITY`, the script uses ad-hoc signing for compilation checks only; this does not enable the privileged service. Build output targets Apple Silicon/macOS 14+. The transparent PNG artwork is packaged into the app icon. Do not move a registered app bundle while its helper is installed.
+
+The independent controller remains available for explicitly authorized hardware tests:
 
 ```sh
 make
@@ -19,32 +58,59 @@ sudo build/magdot working 20
 sudo build/magdot finished 20
 sudo build/magdot attention 20
 sudo build/magdot idle
-osacompile -o MagDot.app scripts/start.applescript
-open MagDot.app
 ```
 
-Keep the app in this checkout. It is a small native AppleScript launcher, not yet a menu-bar app or distributable signed package. Launching starts the unprivileged T3 watcher and requests normal macOS administrator authentication for the LED controller. No sudoers changes, SIP changes, launch daemon, or charging settings are installed. The controller has a hard one-hour lifetime; reopen the app to start another session.
+Do not run manual LED commands while the app has an active session. All controllers share an exclusive lock.
 
 ## T3 integration
 
-`scripts/t3-watch.py` opens `~/.t3/userdata/statev2.sqlite` **read-only** and queries `orchestration_v2_projection_provider_turns`. Request metadata and per-thread visit timestamps are also read. No prompts, messages, tokens, or credentials are read. Unresolved user input/approval takes priority, followed by running turns under one hour across local T3 threads. An observed running → completed transition blinks green for up to 120 seconds, ending when that thread's `lastVisitedAt` reaches its completion timestamp. Cancellation/failure returns idle. Old completions at startup do not trigger a blink.
+The app opens `~/.t3/userdata/statev2.sqlite` read-only and reads only lifecycle metadata from the v2 projections: turn IDs, status/timestamps, thread archive/delete state, `lastVisitedAt`, and request kind/status. It does not query message or request bodies, tokens, or credentials.
 
-This is an experimental adapter to T3's internal schema, not a supported public lifecycle API. Schema errors return idle. A hung turn expires after one hour; suspended turns may remain working until that limit. A four-second state lease restores idle if the watcher stops. State is local under `~/.magdot`, outside the repository.
+This is an internal-schema adapter, not a supported T3 public API. A running turn expires after one hour; there is no arbitrary one-hour app-session limit. Old completions are suppressed on startup. Cancellation/failure clears that turn; other threads may still determine the LED state. Schema/read errors temporarily return control to macOS without discarding pending completions. Visit dismissal depends on T3 recording `lastVisitedAt`, T3 being the foreground app, and the lid being open; individual window visibility is not detected. The `user_input` kind was observed in the live database; approval/permission filters are provisional until observed against a real pending approval.
 
-## Safety and limitations
+## Restoration and limits
 
-The native controller's only SMC key is ACLC. Each invocation locks `/var/run/magdot.lock`. A separate watchdog restores control on EOF or three seconds without heartbeat, including controller SIGKILL. SIGINT/TERM/HUP exit through the watchdog. Killing both processes, kernel failure, or power loss cannot guarantee cleanup; use `sudo build/magdot idle` after recovery.
+Only SMC key **ACLC** is read/written, using values 0, 1, 3, and 4. Restoration seeds the full/not-full battery color, waits 300 ms, then releases to system mode. Firmware may subsequently report green/amber rather than literal zero.
 
-Restoration seeds the battery's expected full/not-full color, waits 300 ms, then writes system mode. Firmware may report amber/green after system mode rather than literal zero. Immediate readback can lag a write; it is not visual proof.
+Each session has a separate watchdog. App disconnect, a four-second heartbeat expiry, explicit Stop/Quit, and controller termination end the session and attempt restoration. Signals are unblocked explicitly. AppKit deferred Quit uses an off-run-loop socket handshake. Sleep stops the active session; tracking resumes on wake with pending completions retained.
 
-Stop other LED-controlling charge apps first. Readback changes between phases stop the controller, but identical writes from another app cannot be detected. Restoration may supersede another controller. Disconnect may not cause SMC errors: patterns can resume on reconnect within the bounded session. SMC errors stop writes and attempt restoration; relaunch after reconnect if necessary. No aggressive retry loop.
+Stop other LED-control utilities first. Unexpected readback stops the controller; identical competing writes cannot be identified. Restoration may supersede a competing controller. SMC failures stop writes; MagSafe reconnection starts a new session. No software can guarantee restoration after killing both controller and watchdog, a kernel failure, or power loss.
 
-To stop: terminate the `magdot watch` process and `t3-watch.py` process using Activity Monitor. Closing the launcher alone does not stop these background processes.
+## Verification
 
-## Provenance and verification
+```sh
+build/MagDot.app/Contents/MacOS/MagDot --self-test
+build/MagDot.app/Contents/MacOS/MagDot --probe-t3
+SIGN_IDENTITY='Developer ID Application: Your Name (TEAMID)' scripts/test-service.sh
+```
 
-Protocol reference: [MagHue SMC.swift](https://github.com/kamenlevi/MagHue/blob/main/Sources/MagHueCore/SMC.swift), licensed GPL-3.0; [JuiceLeft LED controller](https://github.com/Weta-Technologies/JuiceLeft/blob/main/juiceleft-led.c) documents the restoration latch caveat. MagDot uses GPL-3.0-only and restricts the protocol to ACLC values 0, 1, 3, 4.
+The service test builds a **compile-time fake SMC** and uses an isolated temporary socket, with real code-signature checks. Production binaries have no fake-hardware or alternate-socket environment switch. It covers unsigned-client rejection, repeated Start/Stop, active Quit, and app crash recovery without authentication or LED writes.
 
-On the development Mac, compilation with `-Wall -Wextra -Werror` passed, ACLC reads and privileged writes succeeded, and the user visually confirmed the bounded demo's green/amber then green/off patterns. Restoration returned to firmware amber. Crash recovery, competing apps, and physical disconnect/reconnect still need dedicated hardware tests. No machine logs are committed.
+`tests/hardware.py` is an opt-in administrator test that really writes the LED via the controller. Do not run it during an active app session.
 
-Lifecycle tests: `python3 -m unittest discover -s tests`. Covers completion expiry, visit dismissal, attention priority, cancellation, and startup suppression. Visit dismissal follows T3 persisted state; it does not independently inspect the foreground window. Updated slower timings and amber attention still require visual confirmation.
+Protocol sources: [MagHue](https://github.com/kamenlevi/MagHue/blob/main/Sources/MagHueCore/SMC.swift) and [JuiceLeft](https://github.com/Weta-Technologies/JuiceLeft/blob/main/juiceleft-led.c). MagDot uses GPL-3.0-only.
+
+## Sequence settings
+
+Open **Settings…** in the menu bar . The sidebar contains General, States, and About. States shows Working, Done, and Input together, each with its default sequence and adjustable speed. Working alternates green/amber, Done blinks green/off, and Input blinks amber/off. The hardware does not provide a verified red mode.
+
+Lit phases range from 1.6 to 0.4 seconds. Working and Input show 1× at 1 second; Done shows 1× at approximately 0.67 seconds. Blinking presets include an off pause 1.5 times the lit phase. Changes save automatically in local preferences and are applied on subsequent helper heartbeats; Restore Default affects only its own state. Idle and missing T3 data always use system behavior; Stop/Quit always restore system control.
+
+
+The play/pause control previews one state on the connector until paused, Settings is closed, or MagDot is stopped. Starting another preview replaces the current one. Pausing resumes T3 tracking, or restores system control if MagDot was stopped before the preview.
+
+Done duration: 1, 3, 5, 10, or 20 minutes, or Forever (default). A completed chat is acknowledged only when T3 is the foreground app, the laptop lid is known to be open, and T3 marks the chat visited. Background or closed-lid visit updates do not dismiss Done. Starting a new turn in that chat clears its previous completion. This is app-level focus detection, not per-window visibility detection across desktops. The timer starts at completion, including while another thread has priority. Pending completions survive sleep and tracking resumes on wake; finite timers continue to count elapsed time during sleep. Forever lasts within the current tracking session; restarting MagDot clears pending completions. Done’s default 1× is approximately 0.67 seconds green and 1 second off. Input takes priority over Done, then Working, then system control.
+
+About includes signed in-app updates with separate download and restart confirmation. Switch MagDot off before installing an update. A published GitHub release with the signed appcast and ZIP is required; no release has been published as part of local development.
+
+General includes Launch at login (on by default) and Hide from Dock (on by default). Helper approval is followed automatically by connection; no second activation is needed.
+
+Icon builds retain the original PNG artwork and all ICNS resolutions. Larger representations use macOS JPEG 2000 compression (quality 45) to reduce bundle size; small representations stay unchanged. This is lossy encoding, with no additional build dependency.
+
+### MagSafe connection watcher
+
+MagDot reads the MagSafe port's `ConnectionActive` IORegistry property (`PortType = 17`), independently of battery charging or USB-C power. While disconnected it stops T3 polling and releases the LED session; a lightweight, read-only watcher remains in the app and checks once per second. Reconnection automatically starts a fresh helper session and retains pending tracked completions. Manual Stop remains off across reconnects until manual Start or app relaunch. Quit exits the watcher too; open MagDot again (or enable Launch at login) to restore automatic detection.
+
+General → **Hide menu bar icon when unplugged** defaults to on. Open MagDot from Applications/Spotlight to access Settings while its icon is hidden. Turning this setting off keeps the icon visible without activating LED control. An unknown/unsupported connection state stops LED control but keeps the icon accessible. These private IORegistry properties are verified on the development Mac; other Mac models need hardware validation.
+
+See [Licenses & Acknowledgements](ACKNOWLEDGEMENTS.md) for third-party components.

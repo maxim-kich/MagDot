@@ -2,3 +2,9 @@ build/
 *.log
 MagDot.app/
 __pycache__/
+
+dist/
+.local/
+.env*
+*.p12
+*.p8

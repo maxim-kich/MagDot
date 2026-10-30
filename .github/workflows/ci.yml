@@ -1,0 +1,27 @@
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    name: Build and test (Apple Silicon)
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build local validation app (not a distribution release)
+        run: scripts/build-app.sh
+      - name: Validate release tooling
+        run: |
+          python3 -m py_compile scripts/release.py
+          python3 -m unittest discover -s tests -p 'test_release.py'
+          scripts/test-updater-metadata.sh
+          git diff --check
+      - uses: actions/upload-artifact@v4
+        with:
+          name: validation-build-not-for-distribution
+          path: build/MagDot.app
+          retention-days: 7
