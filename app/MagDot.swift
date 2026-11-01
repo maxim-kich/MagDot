@@ -111,9 +111,9 @@ func readT3(observedTurns: Set<String> = []) throws -> ([Turn], [String: Double]
     sqlite3_busy_timeout(db, 150)
     let observed = observedTurns.map { "'" + $0.replacingOccurrences(of:"'",with:"''") + "'" }.joined(separator:",")
     let rows = try query(db, "SELECT p.provider_turn_id,p.thread_id,p.status,p.started_at,p.completed_at FROM orchestration_v2_projection_provider_turns p JOIN orchestration_v2_projection_threads t USING(thread_id) WHERE t.deleted_at IS NULL AND t.archived_at IS NULL AND (p.provider_turn_id IN (\(observed.isEmpty ? "NULL" : observed)) OR p.status='running' OR p.completed_at > strftime('%Y-%m-%dT%H:%M:%fZ','now','-130 seconds'))")
-    let visits = try query(db, "SELECT thread_id,json_extract(payload_json,'$.lastVisitedAt'),json_extract(payload_json,'$.snoozedUntil'),archived_at,deleted_at FROM orchestration_v2_projection_threads")
+    let visits = try query(db, "SELECT thread_id,json_extract(payload_json,'$.lastVisitedAt'),json_extract(payload_json,'$.snoozedUntil'),archived_at,deleted_at,json_extract(payload_json,'$.settledOverride') FROM orchestration_v2_projection_threads")
     let requests = try query(db, "SELECT count(*) FROM orchestration_v2_projection_runtime_requests r JOIN orchestration_v2_projection_threads t USING(thread_id) WHERE r.resolved_at IS NULL AND r.status NOT IN ('resolved','cancelled','failed','expired') AND r.kind IN ('user_input','approval','permission') AND t.archived_at IS NULL AND t.deleted_at IS NULL")
-    return (rows.map { Turn(id: $0[0], thread: $0[1], status: $0[2], started: timestamp($0[3]), completed: timestamp($0[4])) }, Dictionary(uniqueKeysWithValues: visits.map { ($0[0], timestamp($0[1])) }), requests.first?.first != "0", Set(visits.filter { timestamp($0[2]) > Date().timeIntervalSince1970 || !$0[3].isEmpty || !$0[4].isEmpty }.map { $0[0] }))
+    return (rows.map { Turn(id: $0[0], thread: $0[1], status: $0[2], started: timestamp($0[3]), completed: timestamp($0[4])) }, Dictionary(uniqueKeysWithValues: visits.map { ($0[0], timestamp($0[1])) }), requests.first?.first != "0", Set(visits.filter { timestamp($0[2]) > Date().timeIntervalSince1970 || !$0[3].isEmpty || !$0[4].isEmpty || $0[5] == "settled" }.map { $0[0] }))
 }
 func shellQuote(_ value: String) -> String { "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'" }
 func appleQuote(_ value: String) -> String { "\"" + value.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"") + "\"" }
@@ -784,6 +784,13 @@ if CommandLine.arguments.contains("--self-test") {
     _ = snoozed.update([running], visits:[:], attention:false, now:105)
     precondition(snoozed.update([done], visits:[:], attention:false, now:111, doneDuration:0, dismissed:["chat"])=="idle")
     precondition(snoozed.update([done], visits:[:], attention:false, now:112, doneDuration:0)=="idle")
+    var settled = Tracker()
+    _ = settled.update([running,second], visits:[:], attention:false, now:105)
+    precondition(settled.update([done,second], visits:[:], attention:false, now:111, doneDuration:0)=="finished")
+    // Settlement independently dismisses an unread, unsnoozed completion.
+    precondition(settled.update([done,second], visits:[:], attention:false, now:112, doneDuration:0, dismissed:["chat"])=="working")
+    // Unsettling does not replay the acknowledged completion.
+    precondition(settled.update([done,second], visits:[:], attention:false, now:113, doneDuration:0)=="working")
     var pending = Tracker()
     let otherDone = Turn(id:"b",thread:"other",status:"completed",started:100,completed:110)
     _ = pending.update([running,second], visits:[:], attention:false, now:105)
@@ -791,7 +798,7 @@ if CommandLine.arguments.contains("--self-test") {
     precondition(pending.update([], visits:[:], attention:false, now:112, doneDuration:0, dismissed:["chat"])=="finished")
     precondition(pending.finished.keys.sorted()==["other"])
     precondition(pending.update([], visits:["other":113], attention:false, now:114, doneDuration:0)=="idle")
-    print("Unread retention, per-thread read/snooze dismissal, multiple threads, and no replay passed")
+    print("Unread retention, per-thread read/snooze/settle dismissal, multiple threads, and no replay passed")
     precondition(SequencePreference.defaults("finished").milliseconds==667)
     print("Done duration boundaries, Forever, chat visit, and multiple-thread priority passed")
     let testDefaults=UserDefaults(suiteName:"magdot.preference-test.\(UUID().uuidString)")!
@@ -811,7 +818,7 @@ if CommandLine.arguments.contains("--self-test") {
 } else if CommandLine.arguments.contains("--service-status") {
     print("Helper service status: \(SMAppService.daemon(plistName: "com.maximkich.magdot.helper.plist").status.rawValue)")
 } else if CommandLine.arguments.contains("--probe-t3") {
-    do { let (rows, _, attention, dismissed) = try readT3(); print("T3 read succeeded: \(rows.count) recent/running turns; attention=\(attention); snoozed/archived/deleted=\(dismissed.count)") }
+    do { let (rows, _, attention, dismissed) = try readT3(); print("T3 read succeeded: \(rows.count) recent/running turns; attention=\(attention); snoozed/settled/archived/deleted=\(dismissed.count)") }
     catch { print("T3 unavailable"); exit(1) }
 } else {
     let app = NSApplication.shared

@@ -17,7 +17,7 @@ A missing/unreadable T3 database produces idle, not a simulated activity pattern
 | State | LED | Duration |
 |---|---|---|
 | Working | Green 1 s / amber 1 s | While a recent turn is running |
-| Finished | Green ~0.67 s / off ~1 s | Forever by default; optional timer, or reading or snoozing the completed thread |
+| Finished | Green ~0.67 s / off ~1 s | Forever by default; optional timer, or reading, snoozing, or settling the completed thread |
 | Needs input | Amber 1 s / off 1.5 s | While a matching unresolved request exists |
 | Idle | macOS controls the LED | Until new activity |
 
@@ -64,9 +64,9 @@ Do not run manual LED commands while the app has an active session. All controll
 
 ## T3 integration
 
-The app opens `~/.t3/userdata/statev2.sqlite` read-only and reads only lifecycle metadata from the v2 projections: turn IDs, status/timestamps, thread archive/delete state, `lastVisitedAt`, `snoozedUntil`, and request kind/status. It does not query message or request bodies, tokens, or credentials.
+The app opens `~/.t3/userdata/statev2.sqlite` read-only and reads only lifecycle metadata from the v2 projections: turn IDs, status/timestamps, thread archive/delete state, `lastVisitedAt`, `snoozedUntil`, `settledOverride`, and request kind/status. It does not query message or request bodies, tokens, or credentials.
 
-This is an internal-schema adapter, not a supported T3 public API. A running turn expires after one hour; there is no arbitrary one-hour app-session limit. Old completions are suppressed on startup. Cancellation/failure clears that turn; other threads may still determine the LED state. Schema/read errors temporarily return control to macOS without discarding pending completions. Done is cleared when the completed thread is marked read (`lastVisitedAt` at or after completion), snoozed, archived, or deleted. App focus and lid state do not acknowledge a thread. The `user_input` kind was observed in the live database; approval/permission filters are provisional until observed against a real pending approval.
+This is an internal-schema adapter, not a supported T3 public API. A running turn expires after one hour; there is no arbitrary one-hour app-session limit. Old completions are suppressed on startup. Cancellation/failure clears that turn; other threads may still determine the LED state. Schema/read errors temporarily return control to macOS without discarding pending completions. Done is cleared when the completed thread is marked read (`lastVisitedAt` at or after completion), snoozed, settled, archived, or deleted. App focus and lid state do not acknowledge a thread. The `user_input` kind was observed in the live database; approval/permission filters are provisional until observed against a real pending approval.
 
 ## Restoration and limits
 
@@ -99,7 +99,7 @@ Lit phases range from 1.6 to 0.4 seconds. Working and Input show 1× at 1 second
 
 The play/pause control previews one state on the connector until paused, Settings is closed, or MagDot is stopped. Starting another preview replaces the current one. Pausing resumes T3 tracking, or restores system control if MagDot was stopped before the preview.
 
-Done duration: 1, 3, 5, 10, or 20 minutes, or Forever (default). Unread, unsnoozed completions keep blinking whether T3 is in the foreground or background. Reading or snoozing a thread clears only its own Done notification; visiting another thread does not. A thread snoozed until a future deadline cannot trigger Done. Cleared completions do not replay when the snooze expires. Starting a new turn in that chat clears its previous completion. The timer starts at completion, including while another thread has priority. Pending completions survive sleep and tracking resumes on wake; finite timers continue to count elapsed time during sleep. Forever lasts within the current tracking session; restarting MagDot clears pending completions. Done’s default 1× is approximately 0.67 seconds green and 1 second off. Input takes priority over Done, then Working, then system control.
+Done duration: 1, 3, 5, 10, or 20 minutes, or Forever (default). Unread, unsnoozed, unsettled completions keep blinking whether T3 is in the foreground or background. Reading, snoozing, or settling a thread clears only its own Done notification; visiting another thread does not. A thread snoozed until a future deadline or marked settled cannot trigger Done. Cleared completions do not replay when the snooze expires or the thread is unsettled. Starting a new turn in that chat clears its previous completion. The timer starts at completion, including while another thread has priority. Pending completions survive sleep and tracking resumes on wake; finite timers continue to count elapsed time during sleep. Forever lasts within the current tracking session; restarting MagDot clears pending completions. Done’s default 1× is approximately 0.67 seconds green and 1 second off. Input takes priority over Done, then Working, then system control.
 
 About includes signed in-app updates with separate download and restart confirmation. Switch MagDot off before installing an update. A published GitHub release with the signed appcast and ZIP is required; no release has been published as part of local development.
 
