@@ -73,14 +73,14 @@ struct Turn { let id: String; let thread: String; let status: String; let starte
 struct Tracker {
     var active = Set<String>()
     var finished = [String: Double]()
-    mutating func update(_ rows: [Turn], visits: [String: Double], attention: Bool, now: Double, doneDuration: Double = 120, canDismissVisited: Bool = true) -> String {
+    mutating func update(_ rows: [Turn], visits: [String: Double], attention: Bool, now: Double, doneDuration: Double = 120, dismissed: Set<String> = []) -> String {
         for row in rows where active.contains(row.id) && row.status == "completed" && row.completed > 0 {
             finished[row.thread] = max(finished[row.thread] ?? 0, row.completed)
         }
         active = Set(rows.filter { $0.status == "running" && now - $0.started < 3600 }.map(\.id))
         finished = finished.filter { thread, completed in
             let restarted = rows.contains { $0.thread == thread && $0.started > completed }
-            let seen = canDismissVisited && (visits[thread] ?? 0) >= completed
+            let seen = dismissed.contains(thread) || (visits[thread] ?? 0) >= completed
             return !restarted && !seen && (doneDuration == 0 || now < completed + doneDuration)
         }
         return attention ? "attention" : !finished.isEmpty ? "finished" : !active.isEmpty ? "working" : "idle"
@@ -101,7 +101,7 @@ func query(_ db: OpaquePointer, _ sql: String) throws -> [[String]] {
         })
     }
 }
-func readT3(observedTurns: Set<String> = []) throws -> ([Turn], [String: Double], Bool) {
+func readT3(observedTurns: Set<String> = []) throws -> ([Turn], [String: Double], Bool, Set<String>) {
     let path = NSHomeDirectory() + "/.t3/userdata/statev2.sqlite"
     var handle: OpaquePointer?
     guard sqlite3_open_v2(path, &handle, SQLITE_OPEN_READONLY, nil) == SQLITE_OK, let db = handle else {
@@ -111,18 +111,9 @@ func readT3(observedTurns: Set<String> = []) throws -> ([Turn], [String: Double]
     sqlite3_busy_timeout(db, 150)
     let observed = observedTurns.map { "'" + $0.replacingOccurrences(of:"'",with:"''") + "'" }.joined(separator:",")
     let rows = try query(db, "SELECT p.provider_turn_id,p.thread_id,p.status,p.started_at,p.completed_at FROM orchestration_v2_projection_provider_turns p JOIN orchestration_v2_projection_threads t USING(thread_id) WHERE t.deleted_at IS NULL AND t.archived_at IS NULL AND (p.provider_turn_id IN (\(observed.isEmpty ? "NULL" : observed)) OR p.status='running' OR p.completed_at > strftime('%Y-%m-%dT%H:%M:%fZ','now','-130 seconds'))")
-    let visits = try query(db, "SELECT thread_id,json_extract(payload_json,'$.lastVisitedAt') FROM orchestration_v2_projection_threads")
+    let visits = try query(db, "SELECT thread_id,json_extract(payload_json,'$.lastVisitedAt'),json_extract(payload_json,'$.snoozedUntil'),archived_at,deleted_at FROM orchestration_v2_projection_threads")
     let requests = try query(db, "SELECT count(*) FROM orchestration_v2_projection_runtime_requests r JOIN orchestration_v2_projection_threads t USING(thread_id) WHERE r.resolved_at IS NULL AND r.status NOT IN ('resolved','cancelled','failed','expired') AND r.kind IN ('user_input','approval','permission') AND t.archived_at IS NULL AND t.deleted_at IS NULL")
-    return (rows.map { Turn(id: $0[0], thread: $0[1], status: $0[2], started: timestamp($0[3]), completed: timestamp($0[4])) }, Dictionary(uniqueKeysWithValues: visits.map { ($0[0], timestamp($0[1])) }), requests.first?.first != "0")
-}
-// Read-only power state. Unknown lid state must not acknowledge a notification.
-func canAcknowledgeT3() -> Bool {
-    guard NSWorkspace.shared.frontmostApplication?.bundleIdentifier == "com.t3tools.t3code" else { return false }
-    let root = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("IOPMrootDomain"))
-    guard root != 0 else { return false }
-    defer { IOObjectRelease(root) }
-    guard let closed = IORegistryEntryCreateCFProperty(root, "AppleClamshellState" as CFString, kCFAllocatorDefault, 0)?.takeRetainedValue() as? Bool else { return false }
-    return !closed
+    return (rows.map { Turn(id: $0[0], thread: $0[1], status: $0[2], started: timestamp($0[3]), completed: timestamp($0[4])) }, Dictionary(uniqueKeysWithValues: visits.map { ($0[0], timestamp($0[1])) }), requests.first?.first != "0", Set(visits.filter { timestamp($0[2]) > Date().timeIntervalSince1970 || !$0[3].isEmpty || !$0[4].isEmpty }.map { $0[0] }))
 }
 func shellQuote(_ value: String) -> String { "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'" }
 func appleQuote(_ value: String) -> String { "\"" + value.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"") + "\"" }
@@ -610,7 +601,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return
         }
         var mode = "idle", available = true
-        do { let (rows, visits, attention) = try readT3(observedTurns:tracker.active); mode = tracker.update(rows, visits: visits, attention: attention, now: Date().timeIntervalSince1970, doneDuration: DoneDuration.seconds, canDismissVisited: !sleeping && canAcknowledgeT3()) }
+        do { let (rows, visits, attention, dismissed) = try readT3(observedTurns:tracker.active); mode = tracker.update(rows, visits: visits, attention: attention, now: Date().timeIntervalSince1970, doneDuration: DoneDuration.seconds, dismissed: dismissed) }
         catch { available = false }
         if let testing=testState, ready {mode=testing;available=true}
         guard sendState(available ? mode : "system") else { ended(false); return }
@@ -782,24 +773,26 @@ if CommandLine.arguments.contains("--self-test") {
     _ = expiry.update([running,second],visits:[:],attention:false,now:105,doneDuration:60)
     precondition(expiry.update([done,second],visits:[:],attention:false,now:111,doneDuration:60)=="finished")
     precondition(expiry.update([done,second],visits:[:],attention:false,now:170,doneDuration:60)=="working")
-    var background = Tracker()
-    _ = background.update([running], visits:[:], attention:false, now:105, doneDuration:0)
-    precondition(background.update([done], visits:["chat":111], attention:false, now:112, doneDuration:0, canDismissVisited:false)=="finished")
-    // Background, closed lid, and unknown lid all use the same conservative gate.
-    precondition(background.update([], visits:["chat":111], attention:false, now:99999, doneDuration:0, canDismissVisited:false)=="finished")
-    precondition(background.update([], visits:["chat":111], attention:false, now:100000, doneDuration:0, canDismissVisited:true)=="idle")
-    var resumed = Tracker()
-    _ = resumed.update([running], visits:[:], attention:false, now:105, doneDuration:0)
-    // A previously observed completion is still captured after a long sleep.
-    precondition(resumed.update([done], visits:["chat":111], attention:false, now:99999, doneDuration:0, canDismissVisited:false)=="finished")
-    let restarted = Turn(id:"new",thread:"chat",status:"running",started:100000,completed:0)
-    precondition(resumed.update([restarted], visits:[:], attention:false, now:100001, doneDuration:0, canDismissVisited:false)=="working")
-    var backgroundTimed = Tracker()
-    _ = backgroundTimed.update([running], visits:[:], attention:false, now:105, doneDuration:60)
-    precondition(backgroundTimed.update([done], visits:["chat":111], attention:false, now:112, doneDuration:60, canDismissVisited:false)=="finished")
-    precondition(backgroundTimed.update([], visits:[:], attention:false, now:170, doneDuration:60, canDismissVisited:false)=="idle")
+    var unread = Tracker()
+    _ = unread.update([running,second], visits:[:], attention:false, now:105, doneDuration:0)
+    precondition(unread.update([done,second], visits:[:], attention:false, now:111, doneDuration:0)=="finished")
+    // Visiting another thread does not acknowledge the unread completion.
+    precondition(unread.update([], visits:["other":112], attention:false, now:99999, doneDuration:0)=="finished")
+    // A recorded read clears only this thread, regardless of app focus or lid state.
+    precondition(unread.update([], visits:["chat":100000], attention:false, now:100001, doneDuration:0)=="idle")
+    var snoozed = Tracker()
+    _ = snoozed.update([running], visits:[:], attention:false, now:105)
+    precondition(snoozed.update([done], visits:[:], attention:false, now:111, doneDuration:0, dismissed:["chat"])=="idle")
+    precondition(snoozed.update([done], visits:[:], attention:false, now:112, doneDuration:0)=="idle")
+    var pending = Tracker()
+    let otherDone = Turn(id:"b",thread:"other",status:"completed",started:100,completed:110)
+    _ = pending.update([running,second], visits:[:], attention:false, now:105)
+    precondition(pending.update([done,otherDone], visits:[:], attention:false, now:111, doneDuration:0)=="finished")
+    precondition(pending.update([], visits:[:], attention:false, now:112, doneDuration:0, dismissed:["chat"])=="finished")
+    precondition(pending.finished.keys.sorted()==["other"])
+    precondition(pending.update([], visits:["other":113], attention:false, now:114, doneDuration:0)=="idle")
+    print("Unread retention, per-thread read/snooze dismissal, multiple threads, and no replay passed")
     precondition(SequencePreference.defaults("finished").milliseconds==667)
-    print("Background/lid acknowledgement gate, wake retention, restart, and timed expiry passed")
     print("Done duration boundaries, Forever, chat visit, and multiple-thread priority passed")
     let testDefaults=UserDefaults(suiteName:"magdot.preference-test.\(UUID().uuidString)")!
     precondition(SequencePreference.load("working",defaults:testDefaults).preset==3)
@@ -818,7 +811,7 @@ if CommandLine.arguments.contains("--self-test") {
 } else if CommandLine.arguments.contains("--service-status") {
     print("Helper service status: \(SMAppService.daemon(plistName: "com.maximkich.magdot.helper.plist").status.rawValue)")
 } else if CommandLine.arguments.contains("--probe-t3") {
-    do { let (rows, _, attention) = try readT3(); print("T3 read succeeded: \(rows.count) recent/running turns; attention=\(attention)") }
+    do { let (rows, _, attention, dismissed) = try readT3(); print("T3 read succeeded: \(rows.count) recent/running turns; attention=\(attention); snoozed/archived/deleted=\(dismissed.count)") }
     catch { print("T3 unavailable"); exit(1) }
 } else {
     let app = NSApplication.shared
