@@ -7,13 +7,14 @@ import IOKit
 
 // A custom drawing preserves an adaptive monochrome body and a colored status dot.
 final class MenuConnectorView: NSView {
+    var rotation:CGFloat=0 {didSet{needsDisplay=true}}
     var isActive = false { didSet { if oldValue != isActive { needsDisplay = true } } }
     override func hitTest(_ point: NSPoint) -> NSView? { nil }
     override func viewDidChangeEffectiveAppearance() { super.viewDidChangeEffectiveAppearance(); needsDisplay = true }
     override func draw(_ dirtyRect: NSRect) {
         let origin=NSPoint(x:(bounds.width-18)/2,y:(bounds.height-18)/2)
         NSGraphicsContext.saveGraphicsState()
-        let transform=NSAffineTransform();transform.translateX(by:origin.x,yBy:origin.y);transform.scale(by:18.0/22.0);transform.concat()
+        let transform=NSAffineTransform();transform.translateX(by:origin.x+9,yBy:origin.y+9);transform.rotate(byRadians:rotation);transform.scale(by:18.0/22.0);transform.translateX(by:-11,yBy:-11);transform.concat()
         NSColor.labelColor.setStroke()
         let body=NSBezierPath(roundedRect:NSRect(x:1.5,y:3.5,width:19,height:12),xRadius:2,yRadius:2);body.lineWidth=1.5;body.stroke()
         let lip=NSBezierPath();lip.move(to:NSPoint(x:4,y:16));lip.line(to:NSPoint(x:4,y:18));lip.line(to:NSPoint(x:18,y:18));lip.line(to:NSPoint(x:18,y:16));lip.lineWidth=1.5;lip.lineJoinStyle = .round;lip.stroke()
@@ -214,6 +215,7 @@ final class CreditLinkField: NSTextField {
     }
 }
 final class SequenceSettings:NSWindowController,NSWindowDelegate,NSTableViewDataSource,NSTableViewDelegate {
+    var gestureService:MagSafeGestureService?
     var runTest:((String)->Void)?
     var playingState:(()->String?)?
     var active:(()->Bool)?
@@ -252,20 +254,23 @@ final class SequenceSettings:NSWindowController,NSWindowDelegate,NSTableViewData
         statusTimer=Timer.scheduledTimer(withTimeInterval:0.25,repeats:true){[weak self] _ in self?.updateStatus()}
     }
     required init?(coder:NSCoder){fatalError()}
-    func numberOfRows(in tableView:NSTableView)->Int{3}
+    func numberOfRows(in tableView:NSTableView)->Int{4}
     func tableView(_ tableView:NSTableView,viewFor tableColumn:NSTableColumn?,row:Int)->NSView? {
-        let cell=NSTableCellView();let icon=NSImageView();icon.translatesAutoresizingMaskIntoConstraints=false;icon.image=NSImage(systemSymbolName:["gearshape","slider.horizontal.3","info.circle"][row],accessibilityDescription:nil);icon.contentTintColor = .secondaryLabelColor;cell.addSubview(icon)
-        let text=NSTextField(labelWithString:["General","States","About"][row]);text.font = .systemFont(ofSize:13);text.translatesAutoresizingMaskIntoConstraints=false;cell.addSubview(text);cell.textField=text;cell.imageView=icon
+        let cell=NSTableCellView();let icon=NSImageView();icon.translatesAutoresizingMaskIntoConstraints=false;icon.image=NSImage(systemSymbolName:["gearshape","slider.horizontal.3","hand.tap","info.circle"][row],accessibilityDescription:nil);icon.contentTintColor = .secondaryLabelColor;cell.addSubview(icon)
+        let text=NSTextField(labelWithString:["General","States","Double-tap MagSafe","About"][row]);text.font = .systemFont(ofSize:13);text.translatesAutoresizingMaskIntoConstraints=false;cell.addSubview(text);cell.textField=text;cell.imageView=icon
         NSLayoutConstraint.activate([icon.leadingAnchor.constraint(equalTo:cell.leadingAnchor,constant:8),icon.centerYAnchor.constraint(equalTo:cell.centerYAnchor),icon.widthAnchor.constraint(equalToConstant:18),icon.heightAnchor.constraint(equalToConstant:18),text.leadingAnchor.constraint(equalTo:icon.trailingAnchor,constant:8),text.centerYAnchor.constraint(equalTo:icon.centerYAnchor),text.trailingAnchor.constraint(lessThanOrEqualTo:cell.trailingAnchor,constant:-8)]);return cell
     }
     func tableViewSelectionDidChange(_ notification:Notification){selected=max(0,navigation.selectedRow);refresh()}
-    func windowWillClose(_ notification:Notification){cancelPreview();applyDockPreference()}
+    func windowWillClose(_ notification:Notification){gestureService?.preview=false;cancelPreview();applyDockPreference()}
+    func windowDidMiniaturize(_ notification:Notification){gestureService?.preview=false}
+    func windowDidDeminiaturize(_ notification:Notification){gestureService?.preview=selected==2}
     func cancelPreview(){if let state=playingState?(){runTest?(state)}}
-    func present(){applyDockPreference();showWindow(nil);NSApp.activate(ignoringOtherApps:true);window?.makeKeyAndOrderFront(nil)}
+    func present(){applyDockPreference();showWindow(nil);NSApp.activate(ignoringOtherApps:true);window?.makeKeyAndOrderFront(nil);gestureService?.preview=selected==2}
     func updateStatus(){unpluggedSwitch.state=(UserDefaults.standard.object(forKey:"hideWhenUnplugged") as? Bool ?? true) ? .on:.off;loginSwitch.state=SMAppService.mainApp.status == .enabled ? .on:.off;dockSwitch.state=(UserDefaults.standard.object(forKey:"hideFromDock") as? Bool ?? true) ? .on:.off;updateButton.title=UpdateChecker.shared.primaryTitle;updateButton.isEnabled=UpdateChecker.shared.primaryEnabled;cancelUpdate.isHidden = !UpdateChecker.shared.canCancel;updateMessage.stringValue=UpdateChecker.shared.message;activation.state=active?()==true ? .on:.off;let granted=permission?()=="Allowed";permissionStatus.stringValue="Allowed";permissionStatus.isHidden = !granted;permissionButton.isHidden=granted;for row in rows {row.updatePlaying(playingState?()==row.state)}}
     func refresh(){
+        gestureService?.preview=selected==2 && window?.isVisible==true
         content.subviews.forEach{$0.removeFromSuperview()};rows=[]
-        content.addSubview(settingsLabel(["General","States","About"][selected],NSRect(x:28,y:544,width:560,height:34),size:24))
+        content.addSubview(settingsLabel(["General","States","Double-tap MagSafe","About"][selected],NSRect(x:28,y:544,width:560,height:34),size:24))
         switch selected {
         case 0:
             let control=settingsCard(NSRect(x:24,y:440,width:592,height:64));content.addSubview(control);control.contentView?.addSubview(settingsLabel("Activate",NSRect(x:16,y:21,width:470,height:22)));activation.frame=NSRect(x:528,y:20,width:40,height:24);activation.target=self;activation.action = #selector(toggleActive);activation.setAccessibilityLabel("Activate MagDot");control.contentView?.addSubview(activation)
@@ -282,6 +287,12 @@ final class SequenceSettings:NSWindowController,NSWindowDelegate,NSTableViewData
         case 1:
             let states=["working","finished","attention"],names=["Working","Done","Input"],details=["While threads are running, with no input or completion pending.","Takes priority over Working until dismissed or expired.","When a thread needs your input. Takes priority over Done and Working."]
             for i in 0..<3 {let row=SequenceRow(state:states[i],name:names[i],detail:details[i],y:[384.0,180.0,20.0][i],runTest:{[weak self] in self?.runTest?($0)});content.addSubview(row);rows.append(row)}
+        case 2:
+            if let gestureService {
+                content.addSubview(settingsLabel("Double-tap MagSafe to open your agent when it’s done or needs your input. Experimental feature.",NSRect(x:28,y:507,width:560,height:32),size:12,secondary:true))
+                let scroll=NSScrollView(frame:NSRect(x:24,y:18,width:592,height:480));scroll.drawsBackground=false;scroll.hasVerticalScroller=true;scroll.scrollerStyle = .overlay
+                let view=GestureSettingsView(service:gestureService);scroll.documentView=view;content.addSubview(scroll);view.scrollToVisible(NSRect(x:0,y:0,width:592,height:1))
+            }
         default:
             let box=settingsCard(NSRect(x:24,y:150,width:592,height:378));content.addSubview(box);let c=box.contentView!
             let icon=NSImageView(frame:NSRect(x:246,y:242,width:100,height:100));icon.image=Bundle.main.url(forResource:"MagDot",withExtension:"icns").flatMap { NSImage(contentsOf:$0) };icon.imageScaling = .scaleProportionallyUpOrDown;c.addSubview(icon)
@@ -344,6 +355,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var bundleRemoved=false
     var helperConnectionAttempted=false
     var observedHelperApproval:Bool?
+    var nextHelperRetryAt=0.0
     var connectionGate=ConnectionGate()
     var unpluggedTracker:Tracker?
     var tracker = Tracker()
@@ -355,6 +367,10 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var received = ""
     var smokeTicks = 0
     var activity: NSObjectProtocol?
+    let gestureService=MagSafeGestureService()
+    var gestureDone=[String:Double]()
+    var unreadDoneLight=UnreadDoneLight()
+    var gestureDelivered=[String:Double]()
     var settingsWindow: SequenceSettings?
     var testState: String?
     var resumeAfterTest=false
@@ -366,9 +382,18 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if !requested {start()}
         if !requested {testState=nil}
     }
+    func gestureTarget()->String? {
+        guard !sleeping,!quitting else{return nil}
+        do {
+            if let input=try pendingInputThread(){return input}
+            gestureDone=try pendingDoneThreads()
+            gestureDelivered=gestureDelivered.filter{gestureDone[$0.key] != nil}
+            return nextGestureDone(gestureDone,delivered:gestureDelivered)
+        }catch{return nil}
+    }
     @objc func showSettings(){
         if settingsWindow == nil {
-            let settings=SequenceSettings();settingsWindow=settings
+            let settings=SequenceSettings();settings.gestureService=gestureService;settingsWindow=settings
             settings.visibilityChanged={ [weak self] in self?.updateConnectionVisibility() }
             settings.runTest={ [weak self] in self?.testSequence($0) }
             settings.playingState={ [weak self] in self?.testState }
@@ -395,6 +420,14 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         catch { NSApp.terminate(nil); return }
         lockFD = open(directory.appendingPathComponent("app.lock").path, O_CREAT | O_RDWR | O_NOFOLLOW, 0o600)
         guard lockFD >= 0, flock(lockFD, LOCK_EX | LOCK_NB) == 0 else { NSApp.terminate(nil); return }
+        gestureService.target={ [weak self] in self?.gestureTarget() }
+        gestureService.navigate={ [weak self] thread in
+            guard let url=gestureThreadURL(thread) else{return NSRunningApplication.runningApplications(withBundleIdentifier:"com.t3tools.t3code").first?.activate(options:[]) ?? false}
+            let opened=NSWorkspace.shared.open(url)
+            if opened,let completed=self?.gestureDone[thread]{self?.gestureDelivered[thread]=completed}
+            return opened
+        }
+        gestureService.start()
         item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         item.length = 26
         if let button=item.button {
@@ -415,12 +448,13 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let settings = NSMenuItem(title:"Settings…",action:#selector(showSettings),keyEquivalent:","); settings.target=self;menu.addItem(settings);menu.addItem(.separator())
         let quit = NSMenuItem(title: "Quit MagDot", action: #selector(quit), keyEquivalent: "q"); quit.target = self; menu.addItem(quit)
         item.menu = menu
-        _ = NotificationCenter.default.addObserver(forName:Notification.Name("MagDotShowAbout"),object:nil,queue:.main){[weak self] _ in self?.showSettings();self?.settingsWindow?.navigation.selectRowIndexes(IndexSet(integer:2),byExtendingSelection:false)}
+        _ = NotificationCenter.default.addObserver(forName:Notification.Name("MagDotShowAbout"),object:nil,queue:.main){[weak self] _ in self?.showSettings();self?.settingsWindow?.navigation.selectRowIndexes(IndexSet(integer:3),byExtendingSelection:false)}
         UpdateChecker.shared.activity={ [weak self] in UpdateActivity(controllingLED:self?.requested != false) }
         UpdateChecker.shared.beforeRestart={ [weak self] in guard let self else{return};try self.service.unregister() }
         #if !TESTING
         #endif
-        if CommandLine.arguments.contains("--settings") || CommandLine.arguments.contains("--render-settings") {showSettings()}
+        if CommandLine.arguments.contains("--settings") || CommandLine.arguments.contains("--render-settings") || CommandLine.arguments.contains("--experimental") {showSettings()}
+        if CommandLine.arguments.contains("--experimental") {settingsWindow?.navigation.selectRowIndexes(IndexSet(integer:2),byExtendingSelection:false)}
         if CommandLine.arguments.contains("--render-settings") {
             DispatchQueue.main.asyncAfter(deadline:.now()+0.5){[weak self] in
                 guard let view=self?.settingsWindow?.window?.contentView, let rep=view.bitmapImageRepForCachingDisplay(in:view.bounds) else {exit(1)}
@@ -431,6 +465,8 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         NSWorkspace.shared.notificationCenter.addObserver(self, selector: #selector(willSleep), name: NSWorkspace.willSleepNotification, object: nil)
         NSWorkspace.shared.notificationCenter.addObserver(self, selector: #selector(didWake), name: NSWorkspace.didWakeNotification, object: nil)
+        _ = NSWorkspace.shared.notificationCenter.addObserver(forName:NSWorkspace.sessionDidResignActiveNotification,object:nil,queue:.main){[weak self] _ in self?.gestureService.suspended=true}
+        _ = NSWorkspace.shared.notificationCenter.addObserver(forName:NSWorkspace.sessionDidBecomeActiveNotification,object:nil,queue:.main){[weak self] _ in self?.gestureService.suspended=false}
         applyDockPreference()
         if !CommandLine.arguments.contains("--render-settings") {
 #if !TESTING
@@ -485,6 +521,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         item?.button?.toolTip = connectionGate.connected == nil ? "MagDot — connection unavailable" : connectionGate.connected == false ? "MagDot — waiting for MagSafe" : "MagDot — T3 activity light"
     }
     func checkConnection(){
+        defer{writeRuntimeStatus()}
         guard !quitting else{return}
 #if TESTING
         let executablePath=ProcessInfo.processInfo.environment["MAGDOT_TEST_BUNDLE_EXECUTABLE"] ?? Bundle.main.executablePath ?? ""
@@ -497,7 +534,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return
         }
         guard !quitting, !sleeping else{return}
-        _ = connectionGate.observe(magSafeConnection())
+        if connectionGate.observe(magSafeConnection()){nextHelperRetryAt=0}
         let approved=serviceEnabled
         let approvalGranted=observedHelperApproval == false && approved
         observedHelperApproval=approved
@@ -513,12 +550,21 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
             return
         }
-        if connectionGate.activationEnabled && (connectionGate.pendingStart || approvalGranted) && !requested && !stopping {
+        if connectionGate.activationEnabled && (connectionGate.pendingStart || approvalGranted) && !requested && !stopping && Date().timeIntervalSince1970>=nextHelperRetryAt {
             connectionGate.pendingStart=false
             let pending=unpluggedTracker;unpluggedTracker=nil
             start()
             if let pending {tracker=pending}
         }
+    }
+    func writeRuntimeStatus(){
+#if TESTING
+        let directory=URL(fileURLWithPath:ProcessInfo.processInfo.environment["MAGDOT_TEST_DIR"]!)
+#else
+        let directory=FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/MagDot")
+#endif
+        let state:[String:Any]=["appPath":Bundle.main.bundleURL.path,"build":Bundle.main.object(forInfoDictionaryKey:"CFBundleVersion") as? String ?? "unknown","sourceDigest":Bundle.main.object(forInfoDictionaryKey:"MagDotSourceDigest") as? String ?? "unknown","updatedAt":Date().timeIntervalSince1970,"connected":connectionGate.connected as Any? ?? NSNull(),"requested":requested,"ready":ready,"pendingStart":connectionGate.pendingStart,"activationEnabled":connectionGate.activationEnabled,"stopping":stopping,"helperEnabled":serviceEnabled,"nextRetryAt":nextHelperRetryAt,"status":status.title]
+        if let data=try? JSONSerialization.data(withJSONObject:state){try? data.write(to:directory.appendingPathComponent("runtime-status.json"),options:.atomic)}
     }
     func sendState(_ mode: String) -> Bool {
         var p = (mode == "system" || mode == "idle") ? SequencePreference(preset:0,milliseconds:1000) : SequencePreference.load(mode)
@@ -596,7 +642,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let count = recv(socketFD, &buffer, buffer.count, MSG_DONTWAIT)
         if count > 0 {
             received += String(decoding: buffer.prefix(count), as: UTF8.self)
-            if received.contains("READY\n") && !stopping { ready = true; awaitingHelperApproval=false;connectorView.isActive=true;menuSwitch.state = .on;settingsWindow?.updateStatus() }
+            if received.contains("READY\n") && !stopping { ready = true; connectionGate.pendingStart=false;nextHelperRetryAt=0;awaitingHelperApproval=false;connectorView.isActive=true;menuSwitch.state = .on;settingsWindow?.updateStatus() }
             if received.contains("RESTORED\n") { restored = true }
             if received.count > 4096 { received = String(received.suffix(4096)) }
         } else if count == 0 { ended(restored); return }
@@ -610,7 +656,13 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return
         }
         var mode = "idle", available = true
-        do { let (rows, visits, attention) = try readT3(observedTurns:tracker.active); mode = tracker.update(rows, visits: visits, attention: attention, now: Date().timeIntervalSince1970, doneDuration: DoneDuration.seconds, canDismissVisited: !sleeping && canAcknowledgeT3()) }
+        do {
+            let now=Date().timeIntervalSince1970
+            let (rows,visits,attention)=try readT3(observedTurns:tracker.active)
+            let tracked=tracker.update(rows,visits:visits,attention:attention,now:now,doneDuration:DoneDuration.seconds,canDismissVisited:!sleeping && canAcknowledgeT3())
+            let unread=unreadDoneLight.update(try pendingDoneThreads(),now:now,duration:DoneDuration.seconds)
+            mode=UnreadDoneLight.mode(tracked:tracked,unread:unread,working:!tracker.active.isEmpty)
+        }
         catch { available = false }
         if let testing=testState, ready {mode=testing;available=true}
         guard sendState(available ? mode : "system") else { ended(false); return }
@@ -627,6 +679,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         } else if Date().timeIntervalSince(startedAt) > 20 { ended(false, message:"Waiting for background helper") }
     }
     @objc func willSleep() {
+        gestureService.suspended=true
         sleeping = true
         let pending = requested && !stopping ? tracker : unpluggedTracker
         let enabled=connectionGate.activationEnabled
@@ -635,6 +688,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         sleepTracker = pending
     }
     @objc func didWake() {
+        gestureService.suspended=false
         sleeping = false
         guard !requested, !quitting, let pending = sleepTracker else { return }
         sleepTracker = nil
@@ -657,6 +711,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         _ = sendState("quit")
     }
     func ended(_ success: Bool, message: String? = nil) {
+        if connectionGate.activationEnabled && !quitting && !sleeping && connectionGate.canRun{if unpluggedTracker==nil{unpluggedTracker=tracker};connectionGate.pendingStart=true;nextHelperRetryAt=Date().timeIntervalSince1970+2}
         awaitingHelperApproval=connectionGate.activationEnabled && !quitting
         testState=nil
         timer?.invalidate(); timer = nil
@@ -687,6 +742,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
     func applicationWillTerminate(_ notification:Notification){
+        gestureService.stop()
         connectionTimer?.invalidate()
 #if !TESTING
         if bundleRemoved {
@@ -697,7 +753,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
     @objc func quit() { NSApp.terminate(nil) }
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        guard bundleRemoved || UpdateChecker.shared.permitsTermination() else {showSettings();settingsWindow?.navigation.selectRowIndexes(IndexSet(integer:2),byExtendingSelection:false);return .terminateCancel}
+        guard bundleRemoved || UpdateChecker.shared.permitsTermination() else {showSettings();settingsWindow?.navigation.selectRowIndexes(IndexSet(integer:3),byExtendingSelection:false);return .terminateCancel}
         guard requested else { return .terminateNow }
         if socketFD < 0 { ended(true); return .terminateNow }
         quitting = true; stop()
@@ -725,7 +781,14 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 }
 
-if CommandLine.arguments.contains("--self-test") {
+if let i=CommandLine.arguments.firstIndex(of:"--gesture-preference-probe"),i+1<CommandLine.arguments.count {
+    let domain=CommandLine.arguments[i+1]
+    guard domain.hasPrefix("magdot.gesture-test."),let defaults=UserDefaults(suiteName:domain) else{exit(1)}
+    let p=TapPreferences(defaults)
+    let data=try! JSONSerialization.data(withJSONObject:["enabled":p.enabled,"sensitivity":p.sensitivity])
+    FileHandle.standardOutput.write(data)
+} else if CommandLine.arguments.contains("--self-test") {
+    magSafeGestureSelfTest()
     var gate=ConnectionGate()
     precondition(!gate.canRun && gate.iconVisible(hide:true))
     precondition(gate.observe(false) && !gate.canRun && !gate.iconVisible(hide:true))

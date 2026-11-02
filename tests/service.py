@@ -45,9 +45,9 @@ with tempfile.TemporaryDirectory(prefix='md-') as directory:
   assert running.poll() is None, 'App quit during helper restart'
   daemon=subprocess.Popen([helper,'daemon'],env=env,stdout=log,stderr=log)
   time.sleep(5)
-  assert not os.path.exists(os.path.join(directory,'status')), 'Unexpected timer-based reconnection'
+  assert os.path.exists(os.path.join(directory,'status')), 'Enabled activation did not recover after helper returned'
   assert running.poll() is None
-  print('Helper failure does not trigger timed retries',flush=True)
+  print('Enabled activation recovers automatically after transient helper failure',flush=True)
   running.terminate();running.wait(timeout=5)
   running=subprocess.Popen([app,'--start'],env=env,stdout=log,stderr=log)
   for _ in range(100):
