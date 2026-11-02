@@ -18,7 +18,11 @@ struct GestureRecording:Codable {
         guard gap>=0.09,gap<=0.60,max(a.peak,b.peak)/min(a.peak,b.peak)<=6 else{return nil}
         let first=Self.tapShape(a),second=Self.tapShape(b)
         guard first.count==42,second.count==42 else{return nil}
-        return zip(first,second).map{($0+$1)/2}+zip(first,second).map{abs($0-$1)}+[gap*0.5,0.2*log(max(a.peak,b.peak)/min(a.peak,b.peak))]
+        let averages:[Double]=zip(first,second).map{($0+$1)/2}
+        let differences:[Double]=zip(first,second).map{abs($0-$1)}
+        let peakRatio:Double=max(a.peak,b.peak)/min(a.peak,b.peak)
+        let timingAndAmplitude:[Double]=[gap*0.5,0.2*log(peakRatio)]
+        return averages+differences+timingAndAmplitude
     }
     static func tapShape(_ impact:Impact)->[Double]{
         let local=impact.waveform.filter{$0.t>=impact.onset-0.025 && $0.t<=impact.onset+0.070}
