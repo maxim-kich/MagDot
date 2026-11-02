@@ -92,7 +92,7 @@ Protocol sources: [MagHue](https://github.com/kamenlevi/MagHue/blob/main/Sources
 
 ## Sequence settings
 
-Open **Settings…** in the menu bar . The sidebar contains General, States, and About. States shows Working, Done, and Input together, each with its default sequence and adjustable speed. Working alternates green/amber, Done blinks green/off, and Input blinks amber/off. The hardware does not provide a verified red mode.
+Open **Settings…** in the menu bar . The sidebar contains General, States, Experimental, and About. States shows Working, Done, and Input together, each with its default sequence and adjustable speed. Working alternates green/amber, Done blinks green/off, and Input blinks amber/off. The hardware does not provide a verified red mode.
 
 Lit phases range from 1.6 to 0.4 seconds. Working and Input show 1× at 1 second; Done shows 1× at approximately 0.67 seconds. Blinking presets include an off pause 1.5 times the lit phase. Changes save automatically in local preferences and are applied on subsequent helper heartbeats; Restore Default affects only its own state. Idle and missing T3 data always use system behavior; Stop/Quit always restore system control.
 
@@ -114,3 +114,128 @@ MagDot reads the MagSafe port's `ConnectionActive` IORegistry property (`PortTyp
 General → **Hide menu bar icon when unplugged** defaults to on. Open MagDot from Applications/Spotlight to access Settings while its icon is hidden. Turning this setting off keeps the icon visible without activating LED control. An unknown/unsupported connection state stops LED control but keeps the icon accessible. These private IORegistry properties are verified on the development Mac; other Mac models need hardware validation.
 
 See [Licenses & Acknowledgements](ACKNOWLEDGEMENTS.md) for third-party components.
+
+
+### Double-tap MagSafe
+
+Off by default. Enabling asks macOS for **Input Monitoring** using IOKit's access
+request API. The permission row shows **Allowed** once access is granted; after a
+previous denial, Allow opens the relevant System Settings pane. The enabled choice is flushed to disk before the permission request. Some permission
+changes require quitting and reopening MagDot; that relaunch retains the choice. This feature matches only the
+accelerometer service; it does not register keyboard or microphone callbacks.
+
+With access allowed and MagSafe connected, opening Double-tap MagSafe starts the live MacBook preview
+automatically, including when the feature is off. Rings show estimated regions;
+orange means uncertain, and stronger impacts draw larger rings. Settings previews show gestures and can navigate when an agent is eligible. Outside setup, the enabled feature
+keeps the sensor ready while enabled with an open lid. It navigates only while
+an agent is Done or needs input, and rechecks the target at gesture
+confirmation. It opens `t3code://threads/<environment>/<thread>`, prioritizing
+unresolved input over the most recent observed, unacknowledged completion.
+No Accessibility or Automation permission is used for navigation.
+
+**Use default profile** is on initially. With it on, the provided model is used
+and **Sensitivity** tunes tap detection. Turning it off opens personal calibration.
+Tap the highlighted MagSafe connector or corner freely, at your own pace and
+with varied strength. Setup moves through MagSafe, top-right, bottom-left, and
+bottom-right only. There is no requirement to tap in pairs, pause after a pair,
+or perform keyboard/trackpad/handling exercises.
+
+Calibration continuously records short sensor windows, including the vibrations
+between taps. Each window stores raw accelerometer frames, grouped impacts, and
+an aggregate input activity flag. Single taps and freely timed runs of taps all
+count. The model learns short local tap signatures; runtime still combines fresh
+impacts into a double-tap. High-confidence decay vibrations are saved as negative
+examples, using a short stable-waveform prediction and energy decay test. Uncertain
+rejections are not automatically labeled as vibration. Incidental input-active
+windows become background negatives and never count as positive captures. No key
+contents, touch paths, or pointer coordinates are recorded.
+
+Every fourth accepted window is reserved for the existing automatic check and
+does not train the model. Orange circles animate during assessment. At least
+two-thirds of held-out MagSafe impacts must be recognized; held-out corner taps
+and captured decay vibrations must not activate it. Inconclusive locations collect
+more examples and new reserved windows. All dots turn green after the checks pass
+and the profile is saved. This remains a correlated within-session check, without
+a separate user validation exercise or a cross-environment accuracy guarantee.
+
+New profiles use the continuous free-tap format (version 2). Earlier single-tap
+and complete-pair profiles remain saved and readable. Settings offers free-tap
+recalibration without deleting the active profile. Interrupted attempts do not
+overwrite a successful profile.
+
+Raw candidates pass an impact grouper before pairing. Decay stays with its tap;
+a fresh second attack can still pass after 90 ms. A stable short waveform
+prediction helps distinguish a weaker second tap from continuing vibration. The
+raw candidate interval is short enough that a ringing candidate does not consume
+the previous 85-ms interval and hide the second tap. A one-tap runtime window stays
+open for the full pairing interval. Tap Lab retains its existing raw candidate
+interval and publishing workflow.
+
+The connector is drawn partly behind the chassis when connected. While MagSafe is disconnected, the settings controls are dimmed and disabled, and sensing pauses; the title, subtitle, and keyboard illustration retain their normal appearance. Outside calibration, recognized MagSafe impacts produce green rings.
+
+Default and legacy profiles still use a clear MagSafe anchor with an uncertain neighbor only when it is closer to MagSafe than the learned corners. Version-1 complete-gesture profiles classify the pair as a whole; version-2 profiles classify local taps and pair fresh impacts at runtime. A closer stored negative example vetoes a positive custom classification. Sensitivity changes onset detection and the positive location-confidence range, with a wider range for gentle taps and a lower detection floor derived from the personal profile; quiet samples update the noise baseline so startup movement cannot permanently raise the threshold. These are rejection safeguards, not a guarantee of location accuracy. Done-chat candidates come from T3's unread latest completed runs rather than the LED expiry tracker. Successful handoffs advance an in-memory queue, with a later completion in that thread eligible again.
+
+Recent keyboard events and pointer movement, clicks, drags and scrolling suppress
+taps for 750 ms and clear pending pairs. This includes normal trackpad interaction
+and external mice. Plain contact is also monitored through the dynamically loaded private
+MultitouchSupport framework, using contact presence and release state only. No
+positions, key codes, event contents or touch paths are stored. It starts only
+alongside the permitted sensor, stops with it, and reports available devices and
+received frame counts in local diagnostics. This is undocumented and must be
+capability-tested per macOS/hardware version; no universal touch-blocking claim is
+made. API declarations: https://github.com/lauschue/Remotastic/blob/main/MultitouchSupport.h
+Incidental input-active windows during calibration may be saved as background negatives; they never navigate. No additional Accessibility permission is requested. Personal examples live in `Application Support/MagDot/PersonalCalibration`.
+
+The default model remains available independently.
+The first bundled dataset covers **Mac16,12 only**, using the previous frozen
+Desk/Lap features; it is not a validated universal MacBook model. Unsupported
+hardware shows that the gesture model is unavailable. Model identity is automatic;
+users do not select size or supporting surface. The older `gesture.pretrained` preference remains ignored. The new default/custom
+selection persists under `gesture.useDefault`.
+Dataset collection continues separately in Tap Lab. Its connector single-tap
+collector shows positive/negative counts and independent Test results. Publishing
+with **Use this model in MagDot** writes a validated, hardware-specific connector
+model under `~/Library/Application Support/MagDot/Models/`. MagDot reloads that
+model automatically, keeps the bundled model as its initial fallback, and
+suppresses navigation while Tap Lab is frontmost. The runtime gesture remains
+a double-tap. Single taps train the default/legacy model; new personal profiles collect continuous free-tap recordings with between-tap vibration.
+
+The preview starts an uncertain pulse immediately when an onset is detected,
+without waiting for the 140-ms classification window. The same pulse receives
+its area/color and peak-strength update when classification completes, retaining
+its original animation time. Animation uses a 60-Hz common-mode timer; text status
+updates remain throttled to 10 Hz. Training statistics and class radii are cached
+once, avoiding repeated leave-one-out calculations on the UI thread per impact.
+
+Fresh physical positive, negative and typing validation is still required;
+precision varies with support, environment and tapping style. Missing sensor or
+permission, closed/unknown lid, sleep and locked sessions stop sensing. Automated
+`--self-test` covers defaults, cross-process preference persistence,
+permission/lid/lifecycle policy, pair matching, rapid onsets, sensitivity,
+immediate visual-onset delivery and cached/reference classifier parity.
+Native helper IPC regressions remain separate.
+
+
+Experimental Settings uses a scrollable profile section. Default/custom controls
+and their Sensitivity slider share one divided box. A missing custom profile shows
+the red default-profile notice. Calibration hints use short location names; the
+intro fades away. Only the active calibration target pulses, grows and fills with
+sample progress. The diagram reuses the menu-bar connector artwork and colors it
+by physical MagSafe connection state. The default model remains the fallback until
+a custom profile is successfully assessed.
+
+While the Double-tap MagSafe tab is visible, a bounded local diagnostic file (`Application Support/MagDot/gesture-recent.json`) retains the latest six input-free sensor episodes with classification evidence. Typing does not overwrite these test recordings. Navigation diagnostics include an event timestamp so an earlier successful handoff cannot be mistaken for the latest tap. These diagnostics do not label the physical location; the tester supplies that label.
+
+Version-2 personal profiles preserve signed initial motion and fit balanced, regularized feature weights. Existing reserved recordings protect against per-profile regression, with automatic legacy fallback. Saved raw recordings are reused without recalibration. See [the algorithm audit](docs/gesture-algorithm-audit.md) for recorded replay results, limitations, and the reproducible benchmark.
+
+## Local worktree build
+
+Use `SIGN_IDENTITY='<Developer ID identity>' bash scripts/run-worktree.sh` for local development. The canonical bundle is `build/MagDot.app` in this checkout. The command stops running MagDot app instances before rebuilding, refuses to interrupt calibration, increments a local build number, and embeds the source worktree and source digest in the signed bundle. `--build-only` builds without stopping or launching apps. `build/worktree-build.json` identifies the exact local output. Local build numbers do not change the release `BUILD_NUMBER` file.
+
+Disconnect and reconnect reset the gesture stream and any failed-start latch. Enabled LED activation retries transient helper failures after a short delay and retains pending agent states; an explicit manual Stop stays stopped. Local `runtime-status.json` and `gesture-status.json` report the running app path, build and source digest.
+
+The sensitivity slider changes both the impact detection threshold and the MagSafe location-confidence range. The adaptive noise floor and learned detection floor still apply; calibration uses a fixed capture sensitivity. Navigation requires a fresh Done/Input target even in Settings, while eligible tap visualization remains available without one. New calibration uses the centers of the left and right palm rests instead of the lower corners; `targetLayout=palm-rests-v1` distinguishes these recordings while retaining legacy location keys for backward compatibility. The pace badge is centered over the keyboard.
+
+Manually marking a completed T3 chat unread now activates the Done light using the same unread-run eligibility as navigation. The configured Done duration starts when MagDot observes that unread episode; reading and re-marking it rearms the light. Input retains priority. The impact threshold and derived personal detection floor are halved. A later update also connects sensitivity to location confidence; pair timing remains unchanged.
+
+Location sensitivity uses bounded positive-score, positive-margin and template-radius adjustments. The strong-negative cutoff and nearest-negative veto do not relax. Version-2 personal profiles cap unsafe expansion using their saved reserved corner/decay recordings. Calibration validation remains at the midpoint operating setting, and no new capture or setup steps are introduced. Diagnostics report `locationSensitivity` and `locationSensitivityLimit`. These checks are finite saved samples, not a general false-trigger guarantee.

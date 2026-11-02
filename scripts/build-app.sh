@@ -7,11 +7,14 @@ SPARKLE="$PWD/build/sparkle"
 FRAMEWORKS="$SPARKLE/Sparkle.xcframework/macos-arm64_x86_64"
 APP="${MAGDOT_APP_PATH:-build/MagDot.app}"
 VERSION=$(cat VERSION)
-BUILD_NUMBER=$(cat BUILD_NUMBER)
+BUILD_NUMBER=${MAGDOT_BUILD_NUMBER:-$(cat BUILD_NUMBER)}
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources" "$APP/Contents/Library/LaunchDaemons"
+mkdir -p build/gestures
+xcrun clang -target arm64-apple-macos14.0 -O2 -Wall -Wextra -Wno-unused-parameter -c app/Gestures/GestureSensor.c -o build/gestures/Sensor.o
 cp app/MagDot.swift build/main.swift
-xcrun swiftc -swift-version 5 -target arm64-apple-macos14.0 -O build/main.swift app/UpdateChecker.swift app/InAppUpdater.swift -F "$FRAMEWORKS" -framework Sparkle -Xlinker -rpath -Xlinker @executable_path/../Frameworks -framework AppKit -framework ServiceManagement -lsqlite3 -o "$APP/Contents/MacOS/MagDot"
+xcrun swiftc -swift-version 5 -target arm64-apple-macos14.0 -O build/main.swift app/UpdateChecker.swift app/InAppUpdater.swift app/Gestures/*.swift build/gestures/Sensor.o -import-objc-header app/Gestures/GestureSensor.h -framework IOKit -F "$FRAMEWORKS" -framework Sparkle -Xlinker -rpath -Xlinker @executable_path/../Frameworks -framework AppKit -framework ServiceManagement -lsqlite3 -o "$APP/Contents/MacOS/MagDot"
 cp build/magdot "$APP/Contents/Resources/magdot"
+cp app/Resources/MagSafeTapModels.json "$APP/Contents/Resources/MagSafeTapModels.json"
 ./scripts/build-icon.sh "$APP"
 cp LICENSE "$APP/Contents/Resources/LICENSE"
 cat > "$APP/Contents/Info.plist" <<PLIST
