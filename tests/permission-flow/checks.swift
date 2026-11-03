@@ -48,6 +48,7 @@ var registrations=0,navigations=0
 app.testOpenLoginItems={navigations+=1}
 app.testRegisterHelper={registrations+=1;app.testHelperStatus = .requiresApproval}
 app.connectionGate.connected=false
+app.connectionGate.activationEnabled=false
 app.testHelperStatus = .notRegistered
 app.settingsWindow?.managePermission?()
 check(registrations==1 && navigations==0,"registration never forces navigation")
@@ -65,10 +66,12 @@ app.testRegisterHelper={registrations+=1;throw NSError(domain:"fixture",code:1)}
 app.manageHelperPermission()
 check(registrations==3 && navigations==1 && app.status.title=="Helper setup needs attention","registration error does not navigate")
 app.connectionGate.connected=true
+app.manageHelperPermission()
+check(!app.requested && app.activationError != nil,"connected registration failure remains visible and does not start")
 app.helperRegistrationAttempted=false
 app.testRegisterHelper={registrations+=1;app.testHelperStatus = .requiresApproval}
 app.manageHelperPermission()
-check(registrations==4 && navigations==1 && app.requested && !app.ready,"connected permission action registers once and awaits readiness")
+check(registrations==5 && navigations==1 && app.requested && !app.ready,"connected permission action registers once and awaits readiness")
 app.ended(true)
 app.connectionGate.activationEnabled=false
 app.observedHelperApproval=false

@@ -182,6 +182,59 @@ check(settings.statusTimer==nil,"sleep suspension")
 settings.suspended=false
 awaitUI("wake resumes visible Settings timer"){settings.statusTimer != nil}
 check(settings.statusTimer != nil,"wake resumes exactly one timer")
+// Exercise the real activation actions without registering or contacting a helper.
+let controller=App()
+controller.startItem=NSMenuItem();controller.stopItem=NSMenuItem()
+_ = controller.connectionGate.observe(true)
+controller.settingsWindow=settings
+settings.active={controller.activationOn}
+settings.activationStatus={controller.activationDetail}
+settings.activationFailed={controller.activationError != nil}
+settings.setActive={on in if on {controller.start()} else {controller.stop()}}
+settings.activation.state = .on;settings.toggleActive()
+check(controller.requested && !controller.ready,"startup retains intent before READY")
+check(settings.activation.state == .on && controller.menuSwitch.state == .on,"both switches immediately on before READY")
+check(!controller.connectorView.isActive,"connector does not claim control before READY")
+check(settings.activationMessage.stringValue == "Starting…","startup detail below switch")
+controller.stop()
+check(!controller.requested && controller.timer == nil && controller.activationError == nil,"pending startup can be cancelled without an error")
+check(settings.activation.state == .off && controller.menuSwitch.state == .off,"cancel updates both switches")
+controller.start()
+controller.ended(false,message:"Fixture helper connection failed")
+check(settings.activation.state == .off && controller.menuSwitch.state == .off,"failure reverts both switches")
+check(settings.activationMessage.stringValue == "Fixture helper connection failed" && !settings.activationMessage.isHidden,"failure shown below switch")
+check(settings.activationMessage.textColor == NSColor.systemRed,"error visually distinguished")
+controller.menuSwitch.state = .on;controller.toggleFromMenu()
+check(controller.activationError == nil && settings.activation.state == .on,"menu retry clears error and updates Settings immediately")
+var sockets:[Int32]=[-1,-1]
+check(socketpair(AF_UNIX,SOCK_STREAM,0,&sockets)==0,"fake helper socket pair")
+controller.socketFD=sockets[0]
+_ = fcntl(sockets[0],F_SETFL,O_NONBLOCK)
+_ = "READY\n".withCString {send(sockets[1],$0,6,0)}
+controller.tick()
+check(controller.ready && controller.connectorView.isActive,"READY acknowledges control")
+check(settings.activation.state == .on && settings.activationMessage.isHidden,"READY keeps switch on and clears startup detail")
+controller.stop();controller.ended(true);close(sockets[1])
+check(settings.activation.state == .off && settings.activationMessage.isHidden,"successful stop has no failure message")
+controller.start();controller.ended(false)
+check(!settings.activationMessage.isHidden,"generic startup failure has explanation")
+controller.start()
+check(controller.activationError == nil && settings.activation.state == .on,"retry clears previous failure")
+controller.stop()
+let approvalPath=directory.appendingPathComponent("approval").path
+try "pending".write(toFile:approvalPath,atomically:true,encoding:.utf8)
+setenv("MAGDOT_TEST_APPROVAL_FILE",approvalPath,1)
+controller.start();controller.startedAt=Date().addingTimeInterval(-30);controller.tick()
+check(controller.requested && !controller.ready && settings.activation.state == .on,"approval wait retains intent beyond startup timeout")
+check(settings.activationMessage.stringValue.contains("Waiting for approval") && controller.activationError == nil,"approval instructions are not an error")
+controller.stop()
+check(settings.activation.state == .off && settings.activationMessage.isHidden,"approval wait cancellation clears status")
+unsetenv("MAGDOT_TEST_APPROVAL_FILE")
+_ = controller.connectionGate.observe(false)
+controller.start()
+check(!controller.requested && settings.activation.state == .off && settings.activationMessage.stringValue.contains("MagSafe"),"unavailable connector explains failed activation")
+controller.stop()
+print("Activation immediate intent, cancellation, READY, failure and retry passed")
 settings.selected=1;settings.refresh()
 let previousRow=settings.rows.first!
 settings.windowDidBecomeKey(Notification(name:NSWindow.didBecomeKeyNotification))

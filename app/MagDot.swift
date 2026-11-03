@@ -332,6 +332,8 @@ final class SequenceSettings:NSWindowController,NSWindowDelegate,NSTableViewData
     var runTest:((String)->Void)?
     var playingState:(()->String?)?
     var active:(()->Bool)?
+    var activationStatus:(()->String)?
+    var activationFailed:(()->Bool)?
     var setActive:((Bool)->Void)?
     var permission:(()->String)?
     var managePermission:(()->Void)?
@@ -343,6 +345,10 @@ final class SequenceSettings:NSWindowController,NSWindowDelegate,NSTableViewData
     let unpluggedSwitch=NSSwitch()
     var visibilityChanged:(()->Void)?
     let activation=NSSwitch()
+    let activationMessage=NSTextField(wrappingLabelWithString:"")
+    var generalCards=[NSView]()
+    var activationCard:NSBox?
+    let activationLabel=settingsLabel("Activate",.zero)
     let permissionStatus=NSTextField(labelWithString:"")
     let permissionButton=NSButton(title:"Allow…",target:nil,action:nil)
     let navigation=NSTableView()
@@ -418,6 +424,18 @@ final class SequenceSettings:NSWindowController,NSWindowDelegate,NSTableViewData
         if loginSwitch.state != login {loginSwitch.state=login}
         if dockSwitch.state != dock {dockSwitch.state=dock}
         if activation.state != activated {activation.state=activated}
+        let detail=activationStatus?() ?? ""
+        activationMessage.stringValue=detail
+        activationMessage.textColor=activationFailed?()==true ? .systemRed:.secondaryLabelColor
+        activationMessage.isHidden=detail.isEmpty
+        let messageHeight=ceil(activationMessage.cell?.cellSize(forBounds:NSRect(x:0,y:0,width:560,height:CGFloat.greatestFiniteMagnitude)).height ?? 16)
+        let extra:CGFloat=detail.isEmpty ? 0:messageHeight-4
+        activationMessage.frame=NSRect(x:16,y:12,width:560,height:messageHeight)
+        activationCard?.frame=NSRect(x:24,y:440-extra,width:592,height:64+extra)
+        let labelHeight=ceil(activationLabel.fittingSize.height)
+        activationLabel.frame=NSRect(x:16,y:32+extra-labelHeight/2,width:470,height:labelHeight)
+        activation.frame=NSRect(x:528,y:20+extra,width:40,height:24)
+        for (index,card) in generalCards.enumerated() {card.setFrameOrigin(NSPoint(x:24,y:360-CGFloat(index)*80-extra))}
         let updater=UpdateChecker.shared
         if updateButton.title != updater.primaryTitle {updateButton.title=updater.primaryTitle}
         if updateButton.isEnabled != updater.primaryEnabled {updateButton.isEnabled=updater.primaryEnabled}
@@ -431,19 +449,32 @@ final class SequenceSettings:NSWindowController,NSWindowDelegate,NSTableViewData
         for row in rows {row.updatePlaying(playing==row.state)}
     }
     func refresh(){
-        content.subviews.forEach{$0.removeFromSuperview()};rows=[]
+        content.subviews.forEach{$0.removeFromSuperview()};rows=[];generalCards=[];activationCard=nil
         content.addSubview(settingsLabel(["General","States","About"][selected],NSRect(x:28,y:544,width:560,height:34),size:24))
         switch selected {
         case 0:
-            let control=settingsCard(NSRect(x:24,y:440,width:592,height:64));content.addSubview(control);control.contentView?.addSubview(settingsLabel("Activate",NSRect(x:16,y:21,width:470,height:22)));activation.frame=NSRect(x:528,y:20,width:40,height:24);activation.target=self;activation.action = #selector(toggleActive);activation.setAccessibilityLabel("Activate MagDot");control.contentView?.addSubview(activation)
-            let permissions=settingsCard(NSRect(x:24,y:360,width:592,height:64));content.addSubview(permissions)
+            let control=settingsCard(NSRect(x:24,y:440,width:592,height:64));activationCard=control;content.addSubview(control);control.contentView?.addSubview(activationLabel);activation.frame=NSRect(x:528,y:20,width:40,height:24);activation.target=self;activation.action = #selector(toggleActive);activation.setAccessibilityLabel("Activate MagDot");control.contentView?.addSubview(activation)
+            activationMessage.frame=NSRect(x:16,y:12,width:560,height:38);activationMessage.font = .systemFont(ofSize:12);control.contentView?.addSubview(activationMessage)
+            let permissions=settingsCard(NSRect(x:24,y:360,width:592,height:64));content.addSubview(permissions);generalCards.append(permissions)
             permissions.contentView?.addSubview(settingsLabel("Background helper",NSRect(x:16,y:21,width:350,height:22)))
             permissionStatus.frame=NSRect(x:396,y:21,width:180,height:22);permissionStatus.font = .systemFont(ofSize:13);permissionStatus.alignment = .right;permissionStatus.textColor = .systemGreen;permissions.contentView?.addSubview(permissionStatus)
             permissionButton.target=self;permissionButton.action = #selector(openPermissions);permissionButton.bezelStyle = .rounded;permissionButton.frame=NSRect(x:476,y:16,width:100,height:32);permissions.contentView?.addSubview(permissionButton)
             for (index,title) in ["Launch at login","Hide from Dock","Hide menu bar icon when unplugged"].enumerated(){
-                let card=settingsCard(NSRect(x:24,y:280-index*80,width:592,height:64));content.addSubview(card)
+                let card=settingsCard(NSRect(x:24,y:280-index*80,width:592,height:64));content.addSubview(card);generalCards.append(card)
                 card.contentView?.addSubview(settingsLabel(title,NSRect(x:16,y:21,width:470,height:22)))
                 let control=[loginSwitch,dockSwitch,unpluggedSwitch][index];control.frame=NSRect(x:528,y:20,width:40,height:24);control.target=self;control.action=[#selector(toggleLogin),#selector(toggleDock),#selector(toggleUnplugged)][index];control.setAccessibilityLabel(title);card.contentView?.addSubview(control)
+            }
+
+            for case let card as NSBox in generalCards {
+                guard let row=card.contentView else {continue}
+                for view in row.subviews {
+                    let frame=view.frame
+                    let height:CGFloat
+                    if let label=view as? NSTextField {height=ceil(label.fittingSize.height)}
+                    else {height=frame.height}
+                    view.frame=NSRect(x:frame.minX,y:row.bounds.midY-height/2,width:frame.width,height:height)
+                    view.autoresizingMask=[.minYMargin,.maxYMargin]
+                }
             }
 
         case 1:
@@ -546,6 +577,14 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var stopping = false, quitting = false, requested = false, ready = false, restored = false
     var socketFD: Int32 = -1, lockFD: Int32 = -1
     var startedAt = Date(), stopAt = Date()
+    var activationError:String?
+    var activationOn:Bool {requested && !stopping}
+    var activationDetail:String {
+        if let activationError {return activationError}
+        if activationOn && !ready {return serviceEnabled ? "Starting…" : "Waiting for approval. Allow MagDot in System Settings → Login Items & Extensions."}
+        return ""
+    }
+    func updateActivationStatus(){menuSwitch.state=activationOn ? .on:.off;settingsWindow?.updateStatus()}
     var received = ""
     var smokeTicks = 0
     var activity: NSObjectProtocol?
@@ -573,7 +612,9 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
             settings.visibilityChanged={ [weak self] in self?.updateConnectionVisibility() }
             settings.runTest={ [weak self] in self?.testSequence($0) }
             settings.playingState={ [weak self] in self?.testState }
-            settings.active={ [weak self] in self?.requested == true && self?.ready == true && self?.stopping == false }
+            settings.active={ [weak self] in self?.activationOn == true }
+            settings.activationStatus={ [weak self] in self?.activationDetail ?? "" }
+            settings.activationFailed={ [weak self] in self?.activationError != nil }
             settings.setActive={ [weak self] on in if on {self?.start()} else {self?.stop()} }
             settings.permission={ [weak self] in
                 guard let self else{return "Unavailable"}
@@ -746,11 +787,16 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         launchAtStartupItem.isHidden = SMAppService.mainApp.status == .enabled
         settingsWindow?.updateStatus()
     }
-    @objc func toggleFromMenu(){if menuSwitch.state == .on {start()} else {stop()};menuSwitch.state = requested && ready && !stopping ? .on:.off}
+    @objc func toggleFromMenu(){if menuSwitch.state == .on {start()} else {stop()};updateActivationStatus()}
     func applicationShouldHandleReopen(_ sender:NSApplication,hasVisibleWindows flag:Bool)->Bool {showSettings();return true}
     @objc func start() {
+        guard !activationOn else {updateActivationStatus();return}
+        activationError=nil
         connectionGate.activationEnabled=true
-        guard !requested, !stopping, connectionGate.canRun, !sleeping, !quitting else { return }
+        guard !stopping, connectionGate.canRun, !sleeping, !quitting else {
+            activationError = !connectionGate.canRun ? "Could not activate. Connect your MagSafe connector and try again." : "Could not activate while the controller is stopping or sleeping. Try again shortly."
+            updateActivationStatus();return
+        }
         connectionGate.pendingStart=false
         awaitingHelperApproval=true
         helperConnectionAttempted=false
@@ -759,7 +805,9 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if ProcessInfo.processInfo.environment["MAGDOT_TEST_REGISTER_DEFER"] == "1" && !serviceEnabled {return}
         #endif
         prepareHelperRegistration()
-        requested = true; connectorView.isActive = false; menuSwitch.state = .off; startedAt = Date()
+        if activationError != nil {connectionGate.activationEnabled=false;updateActivationStatus();return}
+        requested = true; connectorView.isActive = false; startedAt = Date()
+        updateActivationStatus()
         pollGeneration+=1;pollInFlight=nil;latestMode="system";freshness=LEDFreshness()
         activity = ProcessInfo.processInfo.beginActivity(options: .userInitiatedAllowingIdleSystemSleep, reason: "Maintain the LED restoration heartbeat")
         status.title = "Starting…"; startItem.isEnabled = false; stopItem.isEnabled = true
@@ -793,7 +841,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
             // Approval and launchd startup have no user-facing deadline. Keep the
             // requested activation until connected, stopped, unplugged, or quit.
             guard connectionGate.canRun else {checkConnection();return}
-            guard serviceEnabled else {helperConnectionAttempted=false;status.title="Waiting for helper approval";return}
+            guard serviceEnabled else {helperConnectionAttempted=false;status.title="Waiting for helper approval";updateActivationStatus();return}
             guard !helperConnectionAttempted else{return}
             helperConnectionAttempted=true
             guard connectHelper() else {ended(false,message:"Helper connection failed — use Activate to try again");return}
@@ -802,10 +850,10 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let count = recv(socketFD, &buffer, buffer.count, MSG_DONTWAIT)
         if count > 0 {
             received += String(decoding: buffer.prefix(count), as: UTF8.self)
-            if received.contains("READY\n") && !stopping && !ready { ready = true; awaitingHelperApproval=false;connectorView.isActive=true;menuSwitch.state = .on;settingsWindow?.updateStatus() }
+            if received.contains("READY\n") && !stopping && !ready { ready = true; awaitingHelperApproval=false;connectorView.isActive=true;updateActivationStatus() }
             if received.contains("RESTORED\n") { restored = true }
             if received.count > 4096 { received = String(received.suffix(4096)) }
-        } else if count == 0 { ended(restored); return }
+        } else if count == 0 { ended(restored && stopping); return }
         else if errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR { ended(false); return }
         if stopping {
             if Date().timeIntervalSince(stopAt) > 8 { ended(false) }
@@ -828,7 +876,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     else { print("App Start acknowledged; invoking Stop"); stop() }
                 }
             }
-        } else if Date().timeIntervalSince(startedAt) > 20 { ended(false, message:"Waiting for background helper") }
+        } else if Date().timeIntervalSince(startedAt) > 20 { ended(false, message:"The background helper did not respond. Use Activate to try again.") }
     }
     private func updateModeLabel(_ mode:String){
         guard ready else{return}
@@ -895,6 +943,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         else {unpluggedTracker=pending}
     }
     @objc func stop() {
+        activationError=nil
         pollGeneration+=1;pollInFlight=nil
         connectionGate.activationEnabled=false
         awaitingHelperApproval=false
@@ -902,13 +951,19 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         unpluggedTracker=nil
         sleepTracker = nil
         testState=nil
-        guard requested else { return }
+        guard requested else {updateActivationStatus();return}
         if socketFD < 0 { ended(true); return }
         connectorView.isActive = false
         stopping = true; menuSwitch.state = .off; stopAt = Date(); status.title = "Restoring…"; stopItem.isEnabled = false
         _ = sendState("quit")
+        updateActivationStatus()
     }
     func ended(_ success: Bool, message: String? = nil) {
+        let wasReady=ready, wasStopping=stopping
+        let failed = !success
+        if failed {
+            activationError=message ?? (wasStopping ? "The helper did not confirm LED restoration. Try activating again." : wasReady ? "The background helper disconnected. Use Activate to try again." : "Could not connect to the background helper. Use Activate to try again.")
+        }
         pollGeneration+=1;pollInFlight=nil;latestMode="system";freshness=LEDFreshness()
         pollingQueue.async { [reader] in reader.close() }
         awaitingHelperApproval=connectionGate.activationEnabled && !quitting
@@ -918,7 +973,8 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         connectorView.isActive = false
         requested = false; stopping = false; ready = false; menuSwitch.state = .off
         if let activity { ProcessInfo.processInfo.endActivity(activity); self.activity = nil }
-        status.title = message ?? (success ? "Stopped" : ready ? "Restoration not confirmed" : "Controller unavailable — try Start")
+        status.title = activationError ?? message ?? "Stopped"
+        updateActivationStatus()
         startItem.isEnabled = true; stopItem.isEnabled = false
         if CommandLine.arguments.contains("--smoke-test") {
             print("App Stop completed; restoration acknowledged=\(success)"); NSApp.terminate(nil)
@@ -928,6 +984,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if quitting { print("Quit restoration acknowledged=\(success)"); NSApp.reply(toApplicationShouldTerminate: true) }
     }
     func manageHelperPermission() {
+        activationError=nil
         // Choose from the status BEFORE registration. Registration can initiate
         // system approval UI; never force Settings navigation in the same action.
         switch helperStatus {
@@ -942,7 +999,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         case .enabled: break
         @unknown default: return
         }
-        start()
+        if activationError == nil {start()}
         settingsWindow?.updateStatus()
     }
     func prepareHelperRegistration(explicit:Bool=false) {
@@ -961,6 +1018,8 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
             UserDefaults.standard.set("socket-v1",forKey:"helperRegistrationVersion")
 #endif
         } catch {
+            activationError="Could not set up the background helper: " + error.localizedDescription
+            updateActivationStatus()
             status.title="Helper setup needs attention"
             status.toolTip=error.localizedDescription
             NSLog("MagDot helper registration failed: %@",error.localizedDescription)
