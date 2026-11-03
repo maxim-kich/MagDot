@@ -1,3 +1,4 @@
+import Carbon
 // SPDX-License-Identifier: GPL-3.0-only
 import AppKit
 import SQLite3
@@ -243,7 +244,80 @@ struct SequencePreference {
         defaults.set(["preset":preset,"milliseconds":milliseconds], forKey:"sequence.\(state)")
     }
 }
-func applyDockPreference(){NSApp.setActivationPolicy(UserDefaults.standard.object(forKey:"hideFromDock") as? Bool ?? true ? .accessory:.regular)}
+// Own Dock policy transitions independently of window presentation.
+final class DockVisibilityController {
+    static let shared=DockVisibilityController()
+    private(set) var transitioning=false
+    private var queued:Bool?
+    private weak var protectedWindow:NSWindow?
+    private weak var pendingFocusWindow:NSWindow?
+    private var originalCanHide:Bool?
+    private var observers=[NSObjectProtocol]()
+    init(){
+        let center=NotificationCenter.default
+        observers.append(center.addObserver(forName:NSApplication.didBecomeActiveNotification,object:nil,queue:.main){[weak self] _ in
+            guard let self, let window=self.pendingFocusWindow else{return}
+            self.pendingFocusWindow=nil
+            guard window.isVisible, !window.isMiniaturized, window.isOnActiveSpace else{return}
+            window.makeKey()
+        })
+        observers.append(center.addObserver(forName:NSApplication.willHideNotification,object:nil,queue:.main){[weak self] _ in
+            guard let self, !self.transitioning else{return}
+            // Explicit Hide must still work while the Dock icon is absent.
+            if let value=self.originalCanHide {self.protectedWindow?.canHide=value}
+        })
+        observers.append(center.addObserver(forName:NSApplication.willUnhideNotification,object:nil,queue:.main){[weak self] _ in
+            guard NSApp.activationPolicy() == .accessory else{return}
+            self?.protectedWindow?.canHide=false
+        })
+    }
+    deinit {for observer in observers {NotificationCenter.default.removeObserver(observer)}}
+    @discardableResult
+    func apply(hidden:Bool,window:NSWindow?=nil,userInitiated:Bool=false)->Bool {
+        if transitioning {queued=hidden;return true}
+        let policy:NSApplication.ActivationPolicy=hidden ? .accessory:.regular
+        if let window, protectedWindow !== window {
+            restoreProtection()
+            protectedWindow=window;originalCanHide=window.canHide
+        }
+        if hidden {protectedWindow?.canHide=false}
+        else {restoreProtection()}
+        guard NSApp.activationPolicy() != policy else {return true}
+        let keepFocus=userInitiated && window?.isKeyWindow == true && window?.isOnActiveSpace == true
+        transitioning=true
+        pendingFocusWindow=keepFocus ? window:nil
+        var psn=ProcessSerialNumber(highLongOfPSN:0,lowLongOfPSN:UInt32(kCurrentProcess))
+        let transform=hidden ? kProcessTransformToUIElementApplication:kProcessTransformToForegroundApplication
+        let result=TransformProcessType(&psn,ProcessApplicationTransformState(transform))
+        guard result == noErr else {
+            transitioning=false;pendingFocusWindow=nil;restoreProtection()
+            NSLog("Dock policy change failed: %d",result)
+            return false
+        }
+        // macOS 14+ activation also cancels pending activation yields when the
+        // app is already active. No delayed activation or window reopening.
+        if keepFocus {NSApp.activate();window?.makeKey()}
+        // Serialize rapid opposite requests; this is not a focus-restoration timer.
+        DispatchQueue.main.asyncAfter(deadline:.now()+1) { [weak self] in
+            guard let self else{return}
+            self.transitioning=false
+            self.pendingFocusWindow=nil
+            if let hidden=self.queued {
+                self.queued=nil
+                // A queued change never activates an app the user has left.
+                self.apply(hidden:hidden,window:self.protectedWindow,userInitiated:NSApp.isActive && self.protectedWindow?.isKeyWindow == true)
+            }
+        }
+        return true
+    }
+    private func restoreProtection(){
+        if let originalCanHide {protectedWindow?.canHide=originalCanHide}
+    }
+}
+func applyDockPreference(){
+    DockVisibilityController.shared.apply(hidden:UserDefaults.standard.object(forKey:"hideFromDock") as? Bool ?? true)
+}
+
 enum DoneDuration {
     static let values = [60,180,300,600,1200,0]
     static var seconds: Double {
@@ -320,13 +394,9 @@ final class CreditLinkField: NSTextField {
         addCursorRect(NSRect(x:prefix+2,y:0,width:width,height:bounds.height),cursor:.pointingHand)
     }
 }
-// A native nonactivating panel keeps its keyboard focus independently of
-// app activation when the Dock policy changes. It uses normal window ordering.
 // AppKit occlusion notifications can arrive after an order-out operation. Stop
 // background UI work synchronously, then reconcile again on reveal/focus events.
-final class SettingsWindow:NSPanel {
-    override var canBecomeKey:Bool {true}
-    override var canBecomeMain:Bool {true}
+final class SettingsWindow:NSWindow {
     var visibilityChanged:(()->Void)?
     override func orderOut(_ sender:Any?){super.orderOut(sender);visibilityChanged?()}
     override func orderFront(_ sender:Any?){super.orderFront(sender);visibilityChanged?()}
@@ -363,14 +433,11 @@ final class SequenceSettings:NSWindowController,NSWindowDelegate,NSTableViewData
 #if TESTING
     private(set) var statusUpdateCount=0
 #endif
-    private var dockTransitionGeneration=0
-    private var dockTransitionCanHide:Bool?
     private var closing=false
     private var refreshOnReveal=true
     var suspended=false {didSet{reconcileStatusTimer()}}
     init(){
-        let w=SettingsWindow(contentRect:NSRect(x:0,y:0,width:860,height:640),styleMask:[.titled,.closable,.miniaturizable,.fullSizeContentView,.nonactivatingPanel],backing:.buffered,defer:false)
-        w.isFloatingPanel=false;w.hidesOnDeactivate=false
+        let w=SettingsWindow(contentRect:NSRect(x:0,y:0,width:860,height:640),styleMask:[.titled,.closable,.miniaturizable,.fullSizeContentView],backing:.buffered,defer:false)
         w.collectionBehavior = [.managed, .primary, .fullScreenNone]
         w.title="MagDot Settings";w.titleVisibility = .hidden;w.titlebarAppearsTransparent=true;w.isReleasedWhenClosed=false
         let toolbar=NSToolbar(identifier:"SettingsHeader");toolbar.showsBaselineSeparator=false;toolbar.allowsUserCustomization=false;w.toolbar=toolbar;w.toolbarStyle = .unified
@@ -511,22 +578,10 @@ final class SequenceSettings:NSWindowController,NSWindowDelegate,NSTableViewData
     }
     @objc func toggleUnplugged(){UserDefaults.standard.set(unpluggedSwitch.state == .on,forKey:"hideWhenUnplugged");visibilityChanged?()}
     @objc func toggleDock(){
-        UserDefaults.standard.set(dockSwitch.state == .on,forKey:"hideFromDock")
-        guard let window else {applyDockPreference();return}
-        // Protect the existing window from AppKit's implicit hide while the
-        // activation policy changes. Never hide and then reactivate the app.
-        if dockTransitionCanHide == nil {dockTransitionCanHide=window.canHide}
-        window.canHide=false
-        dockTransitionGeneration+=1
-        let generation=dockTransitionGeneration
-        applyDockPreference()
-        window.makeKeyAndOrderFront(nil)
-        DispatchQueue.main.asyncAfter(deadline:.now()+0.5) { [weak self] in
-            guard let self, self.dockTransitionGeneration==generation else{return}
-            if let canHide=self.dockTransitionCanHide {self.window?.canHide=canHide}
-            self.dockTransitionCanHide=nil
-            self.reconcileStatusTimer()
-        }
+        let hidden=dockSwitch.state == .on
+        if DockVisibilityController.shared.apply(hidden:hidden,window:window,userInitiated:true) {
+            UserDefaults.standard.set(hidden,forKey:"hideFromDock")
+        } else {updateStatus()}
     }
     @objc func toggleActive(){setActive?(activation.state == .on);updateStatus()}
     @objc func openPermissions(){managePermission?()}
