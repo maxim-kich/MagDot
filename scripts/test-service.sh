@@ -14,3 +14,5 @@ scripts/sign-sparkle.sh build/test/MagDot.app "$SIGN_IDENTITY" development
 codesign --force --options runtime --sign "$SIGN_IDENTITY" build/test/helper
 codesign --force --options runtime --sign "$SIGN_IDENTITY" build/test/MagDot.app
 python3 tests/service.py
+
+python3 tests/status-freshness.py
