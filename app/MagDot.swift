@@ -261,7 +261,7 @@ final class SequenceRow: NSView {
     let state:String
     let pattern=NSTextField(labelWithString:"")
     let revert=NSButton()
-    let slider=NSSlider(value:1,minValue:0.625,maxValue:2.5,target:nil,action:nil)
+    let slider=NSSlider(value:0.5,minValue:0,maxValue:1,target:nil,action:nil)
     let speed=NSTextField(labelWithString:"")
     let play=NSButton()
     let duration=NSPopUpButton()
@@ -290,9 +290,17 @@ final class SequenceRow: NSView {
     func updatePlaying(_ playing:Bool){guard lastPlaying != playing else{return};lastPlaying=playing;play.image=NSImage(systemSymbolName:playing ? "pause.fill":"play.fill",accessibilityDescription:playing ? "Pause test":"Play test");play.setAccessibilityLabel("\(playing ? "Pause":"Play") \(state) test");play.toolTip=playing ? "Stop preview and resume normal status":"Preview this sequence on the connector"}
     @objc func testSequence(){runTest(state)}
     @objc func changeDuration(){UserDefaults.standard.set(DoneDuration.values[duration.indexOfSelectedItem],forKey:"doneSeconds");refresh()}
-    @objc func changeSpeed(){var p=SequencePreference.load(state);p.milliseconds=max(400,min(1600,Int((Double(SequencePreference.defaults(state).milliseconds)/slider.doubleValue).rounded())));p.save(state);refresh()}
+    @objc func changeSpeed(){
+        var p=SequencePreference.load(state)
+        let base=Double(SequencePreference.defaults(state).milliseconds)
+        let position=slider.doubleValue
+        // Give slower and faster speeds half of the track each, centered on the default.
+        let milliseconds=position<=0.5 ? 1600+(base-1600)*position*2 : base+(400-base)*(position-0.5)*2
+        p.milliseconds=max(400,min(1600,Int(milliseconds.rounded())))
+        p.save(state);refresh()
+    }
     @objc func reset(){SequencePreference.defaults(state).save(state);if state=="finished" {UserDefaults.standard.removeObject(forKey:"doneSeconds")};refresh()}
-    func refresh(){let p=SequencePreference.load(state);let base=Double(SequencePreference.defaults(state).milliseconds);slider.minValue=base/1600;slider.maxValue=base/400;slider.doubleValue=base/Double(p.milliseconds);speed.stringValue=String(format:"Speed  %.2f×",base/Double(p.milliseconds));revert.isHidden=p.milliseconds==Int(base) && (state != "finished" || DoneDuration.seconds==0);if state=="finished" {duration.selectItem(at:DoneDuration.values.firstIndex(of:Int(DoneDuration.seconds)) ?? 5)}}
+    func refresh(){let p=SequencePreference.load(state);let base=Double(SequencePreference.defaults(state).milliseconds);slider.doubleValue=p.milliseconds>=Int(base) ? 0.5*(1600-Double(p.milliseconds))/(1600-base) : 0.5+0.5*(base-Double(p.milliseconds))/(base-400);speed.stringValue=String(format:"Speed  %.2f×",base/Double(p.milliseconds));revert.isHidden=p.milliseconds==Int(base) && (state != "finished" || DoneDuration.seconds==0);if state=="finished" {duration.selectItem(at:DoneDuration.values.firstIndex(of:Int(DoneDuration.seconds)) ?? 5)}}
 
 }
 final class LinkButton: NSButton {
@@ -510,9 +518,29 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if let path=ProcessInfo.processInfo.environment["MAGDOT_TEST_APPROVAL_FILE"] {
             return (try? String(contentsOfFile:path,encoding:.utf8)) == "enabled"
         }
-        return true
+        return testHelperStatus == .enabled
 #else
         return service.status == .enabled
+#endif
+    }
+#if TESTING
+    var testOnboardingRequired=false
+    var testHelperStatus:SMAppService.Status = .enabled
+    var testRegisterHelper:(() throws -> Void)?
+    var testOpenLoginItems:(()->Void)?
+#endif
+    var helperStatus:SMAppService.Status {
+#if TESTING
+        return testHelperStatus
+#else
+        return service.status
+#endif
+    }
+    var onboardingRequired:Bool {
+#if TESTING
+        return testOnboardingRequired
+#else
+        return !UserDefaults.standard.bool(forKey:"magSafeOnboardingCompleted") && !CommandLine.arguments.contains("--render-settings")
 #endif
     }
     let service = SMAppService.daemon(plistName: "com.maximkich.magdot.helper.plist")
@@ -572,6 +600,13 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if !requested {testState=nil}
     }
     @objc func showSettings(){
+        if onboardingRequired {
+            updateOnboarding()
+            onboardingWindow?.deminiaturize(nil)
+            NSApp.activate(ignoringOtherApps:true)
+            onboardingWindow?.makeKeyAndOrderFront(nil)
+            return
+        }
         if settingsWindow == nil {
             let settings=SequenceSettings();settingsWindow=settings
             settings.visibilityChanged={ [weak self] in self?.updateConnectionVisibility() }
@@ -583,12 +618,11 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
             settings.setActive={ [weak self] on in if on {self?.start()} else {self?.stop()} }
             settings.permission={ [weak self] in
                 guard let self else{return "Unavailable"}
-                switch self.service.status {case .enabled:return "Allowed";case .requiresApproval:return "Approval needed in System Settings";case .notRegistered,.notFound:return "Not registered";@unknown default:return "Unavailable"}
+                switch self.helperStatus {case .enabled:return "Allowed";case .requiresApproval:return "Approval needed in System Settings";case .notRegistered,.notFound:return "Not registered";@unknown default:return "Unavailable"}
             }
             settings.managePermission={ [weak self] in
                 guard let self else{return}
-                self.prepareHelperRegistration(explicit:true)
-                self.start();SMAppService.openSystemSettingsLoginItems()
+                self.manageHelperPermission()
             }
         };settingsWindow?.present()
     }
@@ -657,8 +691,8 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
     func updateOnboarding(){
-#if !TESTING
-        guard !UserDefaults.standard.bool(forKey:"magSafeOnboardingCompleted") else{return}
+        guard onboardingRequired else{return}
+        settingsWindow?.window?.orderOut(nil)
         if onboardingWindow == nil {
             let window=NSWindow(contentRect:NSRect(x:0,y:0,width:480,height:170),styleMask:[.titled,.closable],backing:.buffered,defer:false)
             window.title="Welcome to MagDot";window.isReleasedWhenClosed=false;window.center()
@@ -680,11 +714,14 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         onboardingMessage?.stringValue=connected ? "MagSafe 3 connected" : "Connect your MagSafe 3 cable"
         onboardingMessage?.textColor=connected ? .systemGreen : .labelColor
         onboardingDoneButton?.isEnabled=connected
-#endif
     }
     @objc func dismissOnboarding(){
         guard magSafeConnection() == true else {updateOnboarding();return}
+#if TESTING
+        testOnboardingRequired=false
+#else
         UserDefaults.standard.set(true,forKey:"magSafeOnboardingCompleted")
+#endif
         onboardingWindow?.close();onboardingWindow=nil
     }
     func updateConnectionVisibility(){
@@ -755,11 +792,11 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc func start() {
         guard !activationOn else {updateActivationStatus();return}
         activationError=nil
+        connectionGate.activationEnabled=true
         guard !stopping, connectionGate.canRun, !sleeping, !quitting else {
             activationError = !connectionGate.canRun ? "Could not activate. Connect your MagSafe connector and try again." : "Could not activate while the controller is stopping or sleeping. Try again shortly."
             updateActivationStatus();return
         }
-        connectionGate.activationEnabled=true
         connectionGate.pendingStart=false
         awaitingHelperApproval=true
         helperConnectionAttempted=false
@@ -767,10 +804,8 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         #if TESTING
         if ProcessInfo.processInfo.environment["MAGDOT_TEST_REGISTER_DEFER"] == "1" && !serviceEnabled {return}
         #endif
-        #if !TESTING
         prepareHelperRegistration()
         if activationError != nil {connectionGate.activationEnabled=false;updateActivationStatus();return}
-        #endif
         requested = true; connectorView.isActive = false; startedAt = Date()
         updateActivationStatus()
         pollGeneration+=1;pollInFlight=nil;latestMode="system";freshness=LEDFreshness()
@@ -948,13 +983,40 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if !quitting && !sleeping && sleepTracker != nil { didWake() }
         if quitting { print("Quit restoration acknowledged=\(success)"); NSApp.reply(toApplicationShouldTerminate: true) }
     }
+    func manageHelperPermission() {
+        activationError=nil
+        // Choose from the status BEFORE registration. Registration can initiate
+        // system approval UI; never force Settings navigation in the same action.
+        switch helperStatus {
+        case .notRegistered, .notFound:
+            prepareHelperRegistration(explicit:true)
+        case .requiresApproval:
+#if TESTING
+            testOpenLoginItems?()
+#else
+            SMAppService.openSystemSettingsLoginItems()
+#endif
+        case .enabled: break
+        @unknown default: return
+        }
+        if activationError == nil {start()}
+        settingsWindow?.updateStatus()
+    }
     func prepareHelperRegistration(explicit:Bool=false) {
         // Connection retries must never register/unregister a launchd job again.
         guard explicit || !helperRegistrationAttempted else{return}
         helperRegistrationAttempted=true
         do {
-            if service.status == .notRegistered || service.status == .notFound {try service.register()}
+            if helperStatus == .notRegistered || helperStatus == .notFound {
+#if TESTING
+                try testRegisterHelper?()
+#else
+                try service.register()
+#endif
+            }
+#if !TESTING
             UserDefaults.standard.set("socket-v1",forKey:"helperRegistrationVersion")
+#endif
         } catch {
             activationError="Could not set up the background helper: " + error.localizedDescription
             updateActivationStatus()
