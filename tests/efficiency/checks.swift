@@ -44,9 +44,9 @@ try exec("UPDATE orchestration_v2_projection_provider_turns SET status='complete
 snapshot=try reader.read(observedTurns:tracker.active)
 check(snapshot.1.count==1 && snapshot.1["a"]==date+1,"completion visit included same poll")
 check(reader.visitRowsRead==1,"only relevant visit read")
-check(tracker.update(snapshot.0,visits:snapshot.1,attention:false,now:date+2,canDismissVisited:false)=="finished","background retains completion")
+check(tracker.update(snapshot.0,visits:snapshot.1,attention:false,now:date+2,dismissed:snapshot.3)=="idle","recorded read acknowledges completion without foreground gate")
 snapshot=try reader.read(finishedThreads:Set(tracker.finished.keys))
-check(tracker.update(snapshot.0,visits:snapshot.1,attention:false,now:date+3)=="idle","foreground acknowledges cached visit")
+check(tracker.update(snapshot.0,visits:snapshot.1,attention:false,now:date+3)=="idle","cached visit stays acknowledged")
 try exec("INSERT INTO orchestration_v2_projection_runtime_requests VALUES('a',NULL,'pending','approval')")
 check(try reader.read().2,"external writer invalidates attention cache")
 try exec("UPDATE orchestration_v2_projection_threads SET archived_at='archived'")
@@ -67,6 +67,38 @@ _ = expiryTracker.update([Turn(id:"expiry",thread:"a",status:"running",started:d
 let completed=[Turn(id:"expiry",thread:"a",status:"completed",started:date,completed:date+1)]
 check(expiryTracker.update(completed,visits:[:],attention:false,now:date+2,doneDuration:2)=="finished","completion shown")
 check(expiryTracker.update(completed,visits:[:],attention:false,now:date+4,doneDuration:2)=="idle","cached rows still expire locally")
+// Each dismissal must invalidate a same-key cache and clear only its thread.
+for dismissal in ["read","snooze","settle","archive","delete","remove"] {
+    try exec("DELETE FROM orchestration_v2_projection_provider_turns")
+    try exec("DELETE FROM orchestration_v2_projection_threads WHERE thread_id IN ('a','b')")
+    try exec("INSERT INTO orchestration_v2_projection_threads VALUES('a','{}',NULL,NULL),('b','{}',NULL,NULL)")
+    try exec("INSERT INTO orchestration_v2_projection_provider_turns VALUES('ta','a','running','2026-11-02T00:00:00Z',NULL),('tb','b','running','2026-11-02T00:00:00Z',NULL)")
+    var pending=Tracker()
+    var value=try reader.read()
+    _ = pending.update(value.0,visits:value.1,attention:false,now:date,dismissed:value.3)
+    try exec("UPDATE orchestration_v2_projection_provider_turns SET status='completed',completed_at='2026-11-02T00:00:01Z'")
+    value=try reader.read(observedTurns:pending.active)
+    check(pending.update(value.0,visits:value.1,attention:false,now:date+2,doneDuration:0,dismissed:value.3)=="finished","unread completion retained")
+    let keys=Set(pending.finished.keys)
+    _ = try reader.read(finishedThreads:keys)
+    switch dismissal {
+    case "read": try exec("UPDATE orchestration_v2_projection_threads SET payload_json='{\"lastVisitedAt\":\"2026-11-02T00:00:02Z\"}' WHERE thread_id='a'")
+    case "snooze": try exec("UPDATE orchestration_v2_projection_threads SET payload_json='{\"snoozedUntil\":\"2999-01-01T00:00:00Z\"}' WHERE thread_id='a'")
+    case "settle": try exec("UPDATE orchestration_v2_projection_threads SET payload_json='{\"settledOverride\":\"settled\"}' WHERE thread_id='a'")
+    case "archive": try exec("UPDATE orchestration_v2_projection_threads SET archived_at='archived' WHERE thread_id='a'")
+    case "delete": try exec("UPDATE orchestration_v2_projection_threads SET deleted_at='deleted' WHERE thread_id='a'")
+    default: try exec("DELETE FROM orchestration_v2_projection_threads WHERE thread_id='a'")
+    }
+    value=try reader.read(finishedThreads:keys)
+    _ = pending.update(value.0,visits:value.1,attention:false,now:date+3,doneDuration:0,dismissed:value.3)
+    check(Set(pending.finished.keys)==["b"],"\(dismissal) immediately clears only its thread")
+    try exec("INSERT OR IGNORE INTO orchestration_v2_projection_threads VALUES('a','{}',NULL,NULL)")
+    try exec("UPDATE orchestration_v2_projection_threads SET payload_json='{}',archived_at=NULL,deleted_at=NULL WHERE thread_id='a'")
+    value=try reader.read(finishedThreads:Set(pending.finished.keys))
+    _ = pending.update(value.0,visits:value.1,attention:false,now:date+4,doneDuration:0,dismissed:value.3)
+    check(Set(pending.finished.keys)==["b"],"\(dismissal) does not replay when cleared")
+}
+print("Read/snooze/settle/archive/delete cache invalidation, independent dismissal, and no replay passed")
 try exec("DROP TABLE orchestration_v2_projection_runtime_requests")
 do {_ = try reader.read();preconditionFailure("schema failure must surface")}catch{}
 try exec("CREATE TABLE orchestration_v2_projection_runtime_requests(thread_id TEXT,resolved_at TEXT,status TEXT,kind TEXT)")
@@ -147,7 +179,8 @@ awaitUI("unhide completes"){settings.statusTimer != nil}
 check(settings.activation.state == .on && settings.statusTimer != nil,"app unhide refreshes values")
 settings.suspended=true
 check(settings.statusTimer==nil,"sleep suspension")
-settings.suspended=false;pump(0.3)
+settings.suspended=false
+awaitUI("wake resumes visible Settings timer"){settings.statusTimer != nil}
 check(settings.statusTimer != nil,"wake resumes exactly one timer")
 settings.selected=1;settings.refresh()
 let previousRow=settings.rows.first!
