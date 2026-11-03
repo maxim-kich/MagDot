@@ -503,7 +503,19 @@ final class SequenceSettings:NSWindowController,NSWindowDelegate,NSTableViewData
         updateStatus()
     }
     @objc func toggleUnplugged(){UserDefaults.standard.set(unpluggedSwitch.state == .on,forKey:"hideWhenUnplugged");visibilityChanged?()}
-    @objc func toggleDock(){UserDefaults.standard.set(dockSwitch.state == .on,forKey:"hideFromDock");applyDockPreference();window?.makeKeyAndOrderFront(nil)}
+    @objc func toggleDock(){
+        UserDefaults.standard.set(dockSwitch.state == .on,forKey:"hideFromDock")
+        applyDockPreference()
+        // Removing the Dock icon can hide the app after setActivationPolicy returns.
+        // Allow AppKit to finish the Dock transition before restoring Settings.
+        DispatchQueue.main.asyncAfter(deadline:.now()+0.2) { [weak self] in
+            guard let self, !self.closing, let window=self.window, !window.isMiniaturized else{return}
+            NSApp.unhide(nil)
+            NSApp.activate(ignoringOtherApps:true)
+            window.makeKeyAndOrderFront(nil)
+            self.reconcileStatusTimer()
+        }
+    }
     @objc func toggleActive(){setActive?(activation.state == .on);updateStatus()}
     @objc func openPermissions(){managePermission?()}
     @objc func checkUpdate(){UpdateChecker.shared.openUpdate()}
