@@ -80,7 +80,7 @@ The play/pause control previews one state on the connector until paused, Setting
 
 Done duration: 1, 3, 5, 10, or 20 minutes, or Forever (default). Unread, unsnoozed, unsettled completions keep blinking whether T3 is in the foreground or background. Reading, snoozing, or settling a thread clears only its own Done notification; visiting another thread does not. A thread snoozed until a future deadline or marked settled cannot trigger Done. Cleared completions do not replay when the snooze expires or the thread is unsettled. Starting a new turn in that chat clears its previous completion. The timer starts at completion, including while another thread has priority. Pending completions survive sleep and tracking resumes on wake; finite timers continue to count elapsed time during sleep. Forever lasts within the current tracking session; restarting MagDot clears pending completions. Done’s default 1× is approximately 0.67 seconds green and 1 second off. Input takes priority over Done, then Working, then system control.
 
-About includes signed in-app updates with separate download and restart confirmation. Switch MagDot off before installing an update. Updates require a published GitHub release containing the signed appcast and ZIP.
+About includes signed in-app updates with separate download and restart confirmation. Restart asks for confirmation, then stops LED control and waits for restoration before unregistering the helper and installing. After relaunch, Settings opens on About and the previous activation intent resumes through the normal MagSafe connection, helper approval, and READY gates. If activation was off, it stays off for that relaunch. Updates require a published GitHub release containing the signed appcast and ZIP.
 
 General includes Launch at login (on by default) and Hide from Dock (on by default). Helper approval is followed automatically by connection; no second activation is needed.
 
@@ -93,3 +93,14 @@ MagDot reads the MagSafe port's `ConnectionActive` IORegistry property (`PortTyp
 General → **Hide menu bar icon when unplugged** defaults to on. Open MagDot from Applications/Spotlight to access Settings while its icon is hidden. Turning this setting off keeps the icon visible without activating LED control. An unknown/unsupported connection state stops LED control but keeps the icon accessible. These private IORegistry properties are verified on the development Mac; other Mac models need hardware validation.
 
 See [Licenses & Acknowledgements](../ACKNOWLEDGEMENTS.md) for third-party components.
+
+
+### Updater stop/resume validation
+
+`scripts/test-updater-metadata.sh` covers release policy and one-shot receipt consumption (including OFF, expiry, wrong version, and wrong path). `scripts/test-permission-flow.sh` injects helper operations into the production app lifecycle: no real helper registration or LED writes. It checks acknowledgement-before-unregister, restoration/unregistration failure, cancelled late completion, disconnected ON, approval/READY gating, OFF, and reuse of Settings on About.
+
+Run `scripts/test-updater-local.sh MODE` for each of `success`, `off`, `prepare-failure`, `termination-retry`, `stop-cancel`, `staged-cancel`, `download-cancel`, `bad-archive`, `bad-feed`, and `incompatible`. These disposable, development-signed two-version bundles exercise the production Sparkle driver with a local signed feed, simulated LED activity/restoration, and an isolated preference domain. Evidence is retained under `.local/updater-*`. They never replace the installed MagDot app or access its helper. The successful modes check actual bundle replacement/relaunch and consumption of the original ON/OFF intent; they do not prove physical LED restoration or real helper approval retention.
+
+Restart preparation stores original intent in memory across retries. Cancel/failure clears the relaunch receipt, and a late stop completion cannot unregister or install. Restoration failure requires recovery through a new successful READY session before retry; cancelling leaves control off. Once installation has started, prior Restart consent also permits ordinary Quit after a termination veto; the Restart retry button still asks again. Normal launch and Quit retain their existing policy. Only a matching bundle path/target version may consume the ten-minute receipt, which carries no Tracker or completion state.
+
+Build candidates with a separate `MAGDOT_APP_PATH` and Developer ID `SIGN_IDENTITY`; never build over the installed/running signed app. Real installed-app update, physical LED restoration, approval retention, and visible post-update About behavior remain manual validation gates. Notarization, when requested, uses the existing `drag2-notary` Keychain profile.

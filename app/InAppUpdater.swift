@@ -18,10 +18,31 @@ struct ReleaseUpdate: Equatable {
     }
 }
 
-/// Read synchronously on the main thread; never probe another app to decide if quitting is safe.
+/// Intent is separate from ownership: approval or an unplugged connector may delay control.
 struct UpdateActivity {
     var controllingLED = false
-    var restartBlock: String? { controllingLED ? "Switch MagDot off in General before restarting to install the update." : nil }
+    var activationIntent = false
+}
+
+/// A short-lived receipt for this bundle and target version only. Consumed even on mismatch.
+/// No trackers or pending completion events survive an update.
+struct UpdateRelaunch {
+    static let key = "updateRelaunchOnce"
+    static func save(_ intent: Bool, version: String, defaults: UserDefaults, bundle: Bundle) {
+        defaults.set(["intent": intent, "version": version, "path": bundle.bundleURL.path,
+                      "expires": Date().addingTimeInterval(600).timeIntervalSince1970], forKey: key)
+        defaults.synchronize()
+    }
+    static func clear(_ defaults: UserDefaults) { defaults.removeObject(forKey: key); defaults.synchronize() }
+    static func consume(defaults: UserDefaults = .standard, bundle: Bundle = .main) -> Bool? {
+        let receipt = defaults.dictionary(forKey: key)
+        clear(defaults)
+        guard let receipt, receipt["path"] as? String == bundle.bundleURL.path,
+              receipt["version"] as? String == bundle.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String,
+              let expires = receipt["expires"] as? Double, expires > Date().timeIntervalSince1970,
+              expires <= Date().addingTimeInterval(600).timeIntervalSince1970 else { return nil }
+        return receipt["intent"] as? Bool
+    }
 }
 
 /// Sparkle owns verification, staging and atomic replacement. This driver owns consent.
@@ -29,12 +50,15 @@ struct UpdateActivity {
 final class UpdateChecker: NSObject, SPUUpdaterDelegate, SPUUserDriver, UNUserNotificationCenterDelegate {
     static let shared = UpdateChecker()
     static let changed = Notification.Name("MagDotUpdateStateChanged")
-    enum Phase { case idle, checking, available, downloading, extracting, ready, installing, cancelling }
+    enum Phase { case idle, checking, available, downloading, extracting, ready, preparing, installing, cancelling }
     private(set) var phase: Phase = .idle
     private(set) var message = "Check for a newer version."
     private(set) var release: ReleaseUpdate?
     var activity: () -> UpdateActivity = { UpdateActivity(controllingLED: true) } // Fail closed until attached to the app.
-    var beforeRestart: () throws -> Void = {}
+    var beforeRestart: (@escaping () -> Bool, @escaping (Bool) -> Void) -> Void = { _, done in done(false) }
+    private var originalIntent: Bool?
+    private var preparation = UUID()
+    var restartInProgress: Bool { phase == .preparing || phase == .installing }
     private(set) var restartAuthorized = false
     private(set) var failureCode: Int?
     private(set) var failureCodes: [Int] = []
@@ -76,7 +100,7 @@ final class UpdateChecker: NSObject, SPUUpdaterDelegate, SPUUserDriver, UNUserNo
         return alert.runModal() == .alertFirstButtonReturn
     }
     var checking: Bool { phase == .checking }
-    var hasUpdate: Bool { [.available, .downloading, .extracting, .ready, .installing, .cancelling].contains(phase) }
+    var hasUpdate: Bool { [.available, .downloading, .extracting, .ready, .preparing, .installing, .cancelling].contains(phase) }
     var primaryTitle: String {
         switch phase {
         case .idle: return "Check for Updates"
@@ -85,12 +109,13 @@ final class UpdateChecker: NSObject, SPUUpdaterDelegate, SPUUserDriver, UNUserNo
         case .downloading: return "Downloading…"
         case .extracting: return "Verifying…"
         case .ready: return "Restart"
+        case .preparing: return "Stopping…"
         case .installing: return retryTermination == nil ? "Restarting…" : "Restart"
         case .cancelling: return "Cancelling…"
         }
     }
-    var primaryEnabled: Bool { (phase == .idle && updater?.sessionInProgress != true) || [.available, .ready].contains(phase) || retryTermination != nil }
-    var canCancel: Bool { [.checking, .available, .downloading, .extracting, .ready].contains(phase) && !cancelRequested }
+    var primaryEnabled: Bool { (phase == .idle && updater?.sessionInProgress != true) || [.available, .ready].contains(phase) || (phase == .installing && retryTermination != nil) }
+    var canCancel: Bool { [.checking, .available, .downloading, .extracting, .ready, .preparing].contains(phase) && !cancelRequested }
     var automaticChecks: Bool {
         get { false }
         set {
@@ -192,23 +217,36 @@ final class UpdateChecker: NSObject, SPUUpdaterDelegate, SPUUserDriver, UNUserNo
             choice(.install)
         case .ready, .installing:
             guard let action = retryTermination ?? choice.map({ reply in { reply(.install) } }) else { return }
-            if let reason = activity().restartBlock { message = reason; broadcast(); return }
             guard confirm("Restart MagDot?", "Install the verified update and reopen MagDot. Your settings and permissions are retained.", "Restart") else { return }
             guard !cancelRequested, downloadAuthorized, [.ready, .installing].contains(phase),
                   choice != nil || retryTermination != nil else { return }
-            // The modal dialog pumps the run loop: read real state again after consent.
-            if let reason = activity().restartBlock { message = reason; broadcast(); return }
-            do {try beforeRestart()} catch {message="Could not prepare the background helper for updating. Try again.";broadcast();return}
-            restartAuthorized = true; self.choice = nil; retryTermination = nil
-            set(.installing, "Installing and restarting…")
-            action()
+            // Capture once after consent; retries must not capture the temporary OFF state.
+            if originalIntent == nil { originalIntent = activity().activationIntent }
+            let previousPhase = phase
+            let token = UUID(); preparation = token
+            restartAuthorized = false
+            UpdateRelaunch.clear(defaults)
+            set(.preparing, "Stopping safely before restarting…")
+            beforeRestart({ [weak self] in self?.preparation == token && self?.phase == .preparing && self?.cancelRequested == false }) { [weak self] success in
+                guard let self, self.preparation == token, !self.cancelRequested, self.phase == .preparing else { return }
+                guard success, !self.activity().controllingLED else {
+                    self.set(previousPhase, "Could not stop safely for the update. Try again, or cancel the update."); return
+                }
+                self.restartAuthorized = true; self.choice = nil; self.retryTermination = nil
+                if let release = self.release, let intent = self.originalIntent {
+                    UpdateRelaunch.save(intent, version: release.version, defaults: self.defaults, bundle: self.bundle)
+                }
+                self.set(.installing, "Installing and restarting…")
+                action()
+            }
         default: break
         }
     }
     func cancel() {
         guard canCancel else { return }
         cancelRequested = true; checkGeneration = UUID(); task?.cancel(); task = nil
-        restartAuthorized = false
+        restartAuthorized = false; preparation = UUID(); originalIntent = nil
+        UpdateRelaunch.clear(defaults)
         let waitForSparkle = updater?.sessionInProgress == true
         let wasExtracting = phase == .extracting
         if waitForSparkle { set(.cancelling, "Cancelling update…") }
@@ -229,9 +267,10 @@ final class UpdateChecker: NSObject, SPUUpdaterDelegate, SPUUserDriver, UNUserNo
     /// Sparkle can install a staged update on ordinary quit. Block that path until restart consent.
     func permitsTermination() -> Bool {
         guard downloadAuthorized else { return true }
-        guard restartAuthorized, activity().restartBlock == nil else {
+        guard restartAuthorized, !activity().controllingLED else {
             restartAuthorized = false
-            message = activity().restartBlock ?? "Restart or cancel the pending update before quitting."
+            UpdateRelaunch.clear(defaults)
+            message = "Restart or cancel the pending update before quitting."
             broadcast(); return false
         }
         return true
@@ -256,6 +295,7 @@ final class UpdateChecker: NSObject, SPUUpdaterDelegate, SPUUserDriver, UNUserNo
     }
     func updater(_ updater: SPUUpdater, didFinishUpdateCycleFor updateCheck: SPUUpdateCheck, error: Error?) {
         choice = nil; cancellation = nil; retryTermination = nil
+        preparation = UUID(); originalIntent = nil; UpdateRelaunch.clear(defaults)
         downloadAuthorized = false; restartAuthorized = false
         release = nil
         if cancelRequested { set(.idle, "Update cancelled.") }
@@ -346,11 +386,12 @@ final class UpdateChecker: NSObject, SPUUpdaterDelegate, SPUUserDriver, UNUserNo
     func showReady(toInstallAndRelaunch reply: @escaping (SPUUserUpdateChoice) -> Void) {
         guard !cancelRequested, downloadAuthorized else { reply(.skip); return }
         choice = reply; cancellation = nil
-        set(.ready, activity().restartBlock ?? "Verified update ready. Restart when you’re ready.")
+        set(.ready, "Verified update ready. Restart when you’re ready.")
     }
     func showInstallingUpdate(withApplicationTerminated applicationTerminated: Bool, retryTerminatingApplication: @escaping () -> Void) {
         if !applicationTerminated {
-            // A termination veto must require another explicit Restart click.
+            // Existing restart consent still covers ordinary Quit after a veto.
+            // The Restart button asks again before invoking Sparkle’s retry action.
             self.retryTermination = retryTerminatingApplication
             broadcast()
         }
