@@ -32,6 +32,16 @@ with tempfile.TemporaryDirectory(prefix='md-') as directory:
    print(result.stdout,flush=True)
    assert result.returncode==0 and 'acknowledged=true' in result.stdout,(result.stdout,result.stderr)
    assert not os.path.exists(os.path.join(directory,'status'))
+  # A database read longer than the four-second lease cannot block heartbeat.
+  delayed=subprocess.Popen([app,'--start'],env=dict(env,MAGDOT_TEST_POLL_DELAY='6'),stdout=log,stderr=log)
+  time.sleep(8)
+  assert delayed.poll() is None and os.path.exists(os.path.join(directory,'status')), 'Slow database read starved LED heartbeat'
+  delayed.terminate();delayed.wait(timeout=5)
+  for _ in range(60):
+   if not os.path.exists(os.path.join(directory,'status')):break
+   time.sleep(.1)
+  assert not os.path.exists(os.path.join(directory,'status'))
+  print('Six-second database stall leaves heartbeat alive',flush=True)
   running=subprocess.Popen([app,'--start'],env=env,stdout=log,stderr=log)
   for _ in range(50):
    if os.path.exists(os.path.join(directory,'status')):break

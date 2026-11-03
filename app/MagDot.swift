@@ -62,12 +62,18 @@ struct ConnectionGate {
     func iconVisible(hide:Bool)->Bool { !hide || connected != false }
 }
 
-func timestamp(_ text: String) -> Double {
-    let parser = ISO8601DateFormatter()
-    parser.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-    if let date = parser.date(from: text) { return date.timeIntervalSince1970 }
-    parser.formatOptions = [.withInternetDateTime]
-    return parser.date(from: text)?.timeIntervalSince1970 ?? 0
+// A reader owns its parsers on its serial queue. Never rebuild ICU state per row.
+final class TimestampParser {
+    private let fractional = ISO8601DateFormatter()
+    private let whole = ISO8601DateFormatter()
+    init() {
+        fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        whole.formatOptions = [.withInternetDateTime]
+    }
+    func parse(_ text: String) -> Double {
+        guard !text.isEmpty else { return 0 }
+        return (fractional.date(from:text) ?? whole.date(from:text))?.timeIntervalSince1970 ?? 0
+    }
 }
 struct Turn { let id: String; let thread: String; let status: String; let started: Double; let completed: Double }
 struct Tracker {
@@ -101,20 +107,121 @@ func query(_ db: OpaquePointer, _ sql: String) throws -> [[String]] {
         })
     }
 }
-func readT3(observedTurns: Set<String> = []) throws -> ([Turn], [String: Double], Bool, Set<String>) {
-    let path = NSHomeDirectory() + "/.t3/userdata/statev2.sqlite"
-    var handle: OpaquePointer?
-    guard sqlite3_open_v2(path, &handle, SQLITE_OPEN_READONLY, nil) == SQLITE_OK, let db = handle else {
-        if let handle { sqlite3_close(handle) }; throw DatabaseError()
-    }
-    defer { sqlite3_close(db) }
-    sqlite3_busy_timeout(db, 150)
-    let observed = observedTurns.map { "'" + $0.replacingOccurrences(of:"'",with:"''") + "'" }.joined(separator:",")
-    let rows = try query(db, "SELECT p.provider_turn_id,p.thread_id,p.status,p.started_at,p.completed_at FROM orchestration_v2_projection_provider_turns p JOIN orchestration_v2_projection_threads t USING(thread_id) WHERE t.deleted_at IS NULL AND t.archived_at IS NULL AND (p.provider_turn_id IN (\(observed.isEmpty ? "NULL" : observed)) OR p.status='running' OR p.completed_at > strftime('%Y-%m-%dT%H:%M:%fZ','now','-130 seconds'))")
-    let visits = try query(db, "SELECT thread_id,json_extract(payload_json,'$.lastVisitedAt'),json_extract(payload_json,'$.snoozedUntil'),archived_at,deleted_at,json_extract(payload_json,'$.settledOverride') FROM orchestration_v2_projection_threads")
-    let requests = try query(db, "SELECT count(*) FROM orchestration_v2_projection_runtime_requests r JOIN orchestration_v2_projection_threads t USING(thread_id) WHERE r.resolved_at IS NULL AND r.status NOT IN ('resolved','cancelled','failed','expired') AND r.kind IN ('user_input','approval','permission') AND t.archived_at IS NULL AND t.deleted_at IS NULL")
-    return (rows.map { Turn(id: $0[0], thread: $0[1], status: $0[2], started: timestamp($0[3]), completed: timestamp($0[4])) }, Dictionary(uniqueKeysWithValues: visits.map { ($0[0], timestamp($0[1])) }), requests.first?.first != "0", Set(visits.filter { timestamp($0[2]) > Date().timeIntervalSince1970 || !$0[3].isEmpty || !$0[4].isEmpty || $0[5] == "settled" }.map { $0[0] }))
+typealias T3Snapshot = ([Turn], [String:Double], Bool, Set<String>)
+func t3DatabasePath()->String {
+#if TESTING
+    if let path=ProcessInfo.processInfo.environment["MAGDOT_TEST_DB_PATH"] {return path}
+#endif
+    return NSHomeDirectory()+"/.t3/userdata/statev2.sqlite"
 }
+// Measured from the start of a read, so a delayed result cannot renew an old LED
+// state. This is a software freshness bound, not a physical LED latency promise.
+struct LEDFreshness {
+    static let maximumResponseAge=1.0
+    static let maximumStateAge=1.5
+    private(set) var confirmedAt:Double?
+    mutating func confirm(startedAt:Double,now:Double)->Bool {
+        guard now>=startedAt,now-startedAt<=Self.maximumResponseAge else{return false}
+        confirmedAt=startedAt;return true
+    }
+    func mode(_ mode:String,now:Double)->String {
+        guard let confirmedAt,now>=confirmedAt,now-confirmedAt<=Self.maximumStateAge else{return "system"}
+        return mode
+    }
+}
+// Confined to one queue. The database and its indexes are never modified.
+final class T3Reader {
+    let path:String
+    private var db:OpaquePointer?
+    private var identity:String?
+    private var statements=[String:OpaquePointer]()
+    private let parser=TimestampParser()
+    private var cached:T3Snapshot?
+    private var cachedVersion="", cachedObserved=Set<String>(), cachedFinished=Set<String>()
+    private var refreshedAt=0.0
+    private(set) var refreshCount=0, visitRowsRead=0
+    init(path:String = t3DatabasePath()) { self.path=path }
+    deinit { close() }
+    func close() {
+        for statement in statements.values { sqlite3_finalize(statement) }
+        statements.removeAll()
+        if let db { sqlite3_close(db) }
+        db=nil;identity=nil;cached=nil
+    }
+    private func connect() throws {
+        var info=stat()
+        guard stat(path,&info)==0 else {close();throw DatabaseError()}
+        let next="\(info.st_dev):\(info.st_ino)"
+        if identity != next {close()}
+        if db == nil {
+            var handle:OpaquePointer?
+            guard sqlite3_open_v2(path,&handle,SQLITE_OPEN_READONLY,nil)==SQLITE_OK,let handle else {
+                if let handle {sqlite3_close(handle)};throw DatabaseError()
+            }
+            db=handle;identity=next;sqlite3_busy_timeout(handle,150)
+        }
+    }
+    private func rows(_ sql:String,_ values:[String]=[]) throws -> [[String]] {
+        guard let db else {throw DatabaseError()}
+        let statement:OpaquePointer
+        if let existing=statements[sql] {statement=existing}
+        else {
+            if statements.count>=16 {for s in statements.values {sqlite3_finalize(s)};statements.removeAll()}
+            var prepared:OpaquePointer?
+            guard sqlite3_prepare_v2(db,sql,-1,&prepared,nil)==SQLITE_OK,let prepared else {throw DatabaseError()}
+            statement=prepared;statements[sql]=statement
+        }
+        defer {sqlite3_reset(statement);sqlite3_clear_bindings(statement)}
+        for (i,value) in values.enumerated() {
+            let result=value.withCString {sqlite3_bind_text(statement,Int32(i+1),$0,-1,unsafeBitCast(-1,to:sqlite3_destructor_type.self))}
+            guard result==SQLITE_OK else {throw DatabaseError()}
+        }
+        var result=[[String]]()
+        while true {
+            let code=sqlite3_step(statement)
+            if code==SQLITE_DONE {return result}
+            guard code==SQLITE_ROW else {throw DatabaseError()}
+            result.append((0..<sqlite3_column_count(statement)).map {sqlite3_column_text(statement,$0).map{String(cString:$0)} ?? ""})
+        }
+    }
+    func read(observedTurns:Set<String>=[],finishedThreads:Set<String>=[]) throws -> T3Snapshot {
+        do {
+            try connect()
+            _ = try rows("BEGIN")
+            defer {_ = try? rows("ROLLBACK")}
+            let version=try rows("PRAGMA data_version").first?.first ?? ""
+            let now=ProcessInfo.processInfo.systemUptime
+            // Keep a bounded superset of recent rows. Tracker still applies time-based
+            // expiry on every tick, including when no database transaction changes.
+            if let cached,version==cachedVersion,observedTurns==cachedObserved,finishedThreads==cachedFinished,now-refreshedAt<30 {return cached}
+            let observed=observedTurns.sorted()
+            let marks=observed.isEmpty ? "NULL":Array(repeating:"?",count:observed.count).joined(separator:",")
+            let turns=try rows("SELECT p.provider_turn_id,p.thread_id,p.status,p.started_at,p.completed_at FROM orchestration_v2_projection_provider_turns p JOIN orchestration_v2_projection_threads t USING(thread_id) WHERE t.deleted_at IS NULL AND t.archived_at IS NULL AND (p.provider_turn_id IN (\(marks)) OR p.status='running' OR p.completed_at > strftime('%Y-%m-%dT%H:%M:%fZ','now','-130 seconds'))",observed)
+            // A completion observed on this poll must be dismissible on this poll too.
+            let relevant=finishedThreads.union(turns.filter {observedTurns.contains($0[0]) && $0[2]=="completed"}.map{$0[1]}).sorted()
+            var visits=[String:Double]()
+            var dismissed=Set<String>()
+            if !relevant.isEmpty {
+                let marks=Array(repeating:"?",count:relevant.count).joined(separator:",")
+                let result=try rows("SELECT thread_id,json_extract(payload_json,'$.lastVisitedAt'),json_extract(payload_json,'$.snoozedUntil'),archived_at,deleted_at,json_extract(payload_json,'$.settledOverride') FROM orchestration_v2_projection_threads WHERE thread_id IN (\(marks))",relevant)
+                visitRowsRead+=result.count
+                // Missing threads are deleted too. Fetch only relevant completions,
+                // including pending ones whose turn rows are no longer returned.
+                dismissed=Set(relevant).subtracting(result.map{$0[0]})
+                let wallNow=Date().timeIntervalSince1970
+                for row in result {
+                    visits[row[0]]=parser.parse(row[1])
+                    if parser.parse(row[2])>wallNow || !row[3].isEmpty || !row[4].isEmpty || row[5]=="settled" {dismissed.insert(row[0])}
+                }
+            }
+            let requests=try rows("SELECT EXISTS(SELECT 1 FROM orchestration_v2_projection_runtime_requests r JOIN orchestration_v2_projection_threads t USING(thread_id) WHERE r.resolved_at IS NULL AND r.status NOT IN ('resolved','cancelled','failed','expired') AND r.kind IN ('user_input','approval','permission') AND t.archived_at IS NULL AND t.deleted_at IS NULL)")
+            let result:T3Snapshot=(turns.map {Turn(id:$0[0],thread:$0[1],status:$0[2],started:parser.parse($0[3]),completed:parser.parse($0[4]))},visits,requests.first?.first=="1",dismissed)
+            cached=result;cachedVersion=version;cachedObserved=observedTurns;cachedFinished=finishedThreads;refreshedAt=now;refreshCount+=1
+            return result
+        } catch {close();throw error}
+    }
+}
+func readT3(observedTurns:Set<String>=[]) throws -> T3Snapshot {try T3Reader().read(observedTurns:observedTurns)}
 func shellQuote(_ value: String) -> String { "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'" }
 func appleQuote(_ value: String) -> String { "\"" + value.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"") + "\"" }
 
@@ -179,7 +286,8 @@ final class SequenceRow: NSView {
         refresh()
     }
     required init?(coder:NSCoder){fatalError()}
-    func updatePlaying(_ playing:Bool){play.image=NSImage(systemSymbolName:playing ? "pause.fill":"play.fill",accessibilityDescription:playing ? "Pause test":"Play test");play.setAccessibilityLabel("\(playing ? "Pause":"Play") \(state) test");play.toolTip=playing ? "Stop preview and resume normal status":"Preview this sequence on the connector"}
+    private var lastPlaying:Bool?
+    func updatePlaying(_ playing:Bool){guard lastPlaying != playing else{return};lastPlaying=playing;play.image=NSImage(systemSymbolName:playing ? "pause.fill":"play.fill",accessibilityDescription:playing ? "Pause test":"Play test");play.setAccessibilityLabel("\(playing ? "Pause":"Play") \(state) test");play.toolTip=playing ? "Stop preview and resume normal status":"Preview this sequence on the connector"}
     @objc func testSequence(){runTest(state)}
     @objc func changeDuration(){UserDefaults.standard.set(DoneDuration.values[duration.indexOfSelectedItem],forKey:"doneSeconds");refresh()}
     @objc func changeSpeed(){var p=SequencePreference.load(state);p.milliseconds=max(400,min(1600,Int((Double(SequencePreference.defaults(state).milliseconds)/slider.doubleValue).rounded())));p.save(state);refresh()}
@@ -204,6 +312,14 @@ final class CreditLinkField: NSTextField {
         addCursorRect(NSRect(x:prefix+2,y:0,width:width,height:bounds.height),cursor:.pointingHand)
     }
 }
+// AppKit occlusion notifications can arrive after an order-out operation. Stop
+// background UI work synchronously, then reconcile again on reveal/focus events.
+final class SettingsWindow:NSWindow {
+    var visibilityChanged:(()->Void)?
+    override func orderOut(_ sender:Any?){super.orderOut(sender);visibilityChanged?()}
+    override func orderFront(_ sender:Any?){super.orderFront(sender);visibilityChanged?()}
+    override func makeKeyAndOrderFront(_ sender:Any?){super.makeKeyAndOrderFront(sender);visibilityChanged?()}
+}
 final class SequenceSettings:NSWindowController,NSWindowDelegate,NSTableViewDataSource,NSTableViewDelegate {
     var runTest:((String)->Void)?
     var playingState:(()->String?)?
@@ -226,12 +342,19 @@ final class SequenceSettings:NSWindowController,NSWindowDelegate,NSTableViewData
     var rows=[SequenceRow]()
     var selected=0
     var statusTimer:Timer?
+#if TESTING
+    private(set) var statusUpdateCount=0
+#endif
+    private var closing=false
+    private var refreshOnReveal=true
+    var suspended=false {didSet{reconcileStatusTimer()}}
     init(){
-        let w=NSWindow(contentRect:NSRect(x:0,y:0,width:860,height:640),styleMask:[.titled,.closable,.miniaturizable,.fullSizeContentView],backing:.buffered,defer:false)
+        let w=SettingsWindow(contentRect:NSRect(x:0,y:0,width:860,height:640),styleMask:[.titled,.closable,.miniaturizable,.fullSizeContentView],backing:.buffered,defer:false)
         w.collectionBehavior = [.managed, .primary, .fullScreenNone]
         w.title="MagDot Settings";w.titleVisibility = .hidden;w.titlebarAppearsTransparent=true;w.isReleasedWhenClosed=false
         let toolbar=NSToolbar(identifier:"SettingsHeader");toolbar.showsBaselineSeparator=false;toolbar.allowsUserCustomization=false;w.toolbar=toolbar;w.toolbarStyle = .unified
         super.init(window:w);w.delegate=self
+        w.visibilityChanged={ [weak self] in self?.reconcileStatusTimer() }
         let root=w.contentView!;let frame=NSRect(x:8,y:8,width:204,height:624);let inner=NSView(frame:NSRect(origin:.zero,size:frame.size));let sidebar:NSView
         if #available(macOS 26.0,*) {let glass=NSGlassEffectView(frame:frame);glass.style = .regular;glass.cornerRadius=20;glass.contentView=inner;sidebar=glass}
         else {let effect=NSVisualEffectView(frame:frame);effect.material = .sidebar;effect.blendingMode = .behindWindow;effect.state = .active;effect.wantsLayer=true;effect.layer?.cornerRadius=20;effect.layer?.masksToBounds=true;effect.addSubview(inner);sidebar=effect}
@@ -240,7 +363,10 @@ final class SequenceSettings:NSWindowController,NSWindowDelegate,NSTableViewData
         let column=NSTableColumn(identifier:NSUserInterfaceItemIdentifier("section"));column.width=204;navigation.addTableColumn(column);navigation.headerView=nil;navigation.rowHeight=34;navigation.intercellSpacing=NSSize(width:0,height:4);navigation.style = .sourceList;navigation.backgroundColor = .clear;navigation.dataSource=self;navigation.delegate=self;scroll.documentView=navigation;inner.addSubview(scroll)
         root.addSubview(content);root.addSubview(settingsLabel("MagDot",NSRect(x:248,y:603,width:584,height:22)))
         navigation.selectRowIndexes(IndexSet(integer:0),byExtendingSelection:false);refresh();w.center()
-        statusTimer=Timer.scheduledTimer(withTimeInterval:0.25,repeats:true){[weak self] _ in self?.updateStatus()}
+        NotificationCenter.default.addObserver(self,selector:#selector(updateStatus),name:UpdateChecker.changed,object:nil)
+        NotificationCenter.default.addObserver(self,selector:#selector(refreshAfterActivation),name:NSApplication.didBecomeActiveNotification,object:nil)
+        NotificationCenter.default.addObserver(self,selector:#selector(reconcileStatusTimer),name:NSApplication.didHideNotification,object:nil)
+        NotificationCenter.default.addObserver(self,selector:#selector(reconcileStatusTimer),name:NSApplication.didUnhideNotification,object:nil)
     }
     required init?(coder:NSCoder){fatalError()}
     func numberOfRows(in tableView:NSTableView)->Int{3}
@@ -250,10 +376,52 @@ final class SequenceSettings:NSWindowController,NSWindowDelegate,NSTableViewData
         NSLayoutConstraint.activate([icon.leadingAnchor.constraint(equalTo:cell.leadingAnchor,constant:8),icon.centerYAnchor.constraint(equalTo:cell.centerYAnchor),icon.widthAnchor.constraint(equalToConstant:18),icon.heightAnchor.constraint(equalToConstant:18),text.leadingAnchor.constraint(equalTo:icon.trailingAnchor,constant:8),text.centerYAnchor.constraint(equalTo:icon.centerYAnchor),text.trailingAnchor.constraint(lessThanOrEqualTo:cell.trailingAnchor,constant:-8)]);return cell
     }
     func tableViewSelectionDidChange(_ notification:Notification){selected=max(0,navigation.selectedRow);refresh()}
-    func windowWillClose(_ notification:Notification){cancelPreview();applyDockPreference()}
+    deinit {statusTimer?.invalidate();NotificationCenter.default.removeObserver(self)}
+    var statusVisible:Bool { !closing && !suspended && !NSApp.isHidden && window?.isVisible==true && window?.isMiniaturized==false && window?.occlusionState.contains(.visible)==true }
+    @objc func reconcileStatusTimer(){
+        guard statusVisible else {statusTimer?.invalidate();statusTimer=nil;refreshOnReveal=true;return}
+        // Rebuild preference-backed rows on reveal; they may have changed while
+        // the window was closed or covered. Focus changes refresh status too.
+        if refreshOnReveal {refreshOnReveal=false;refresh()}
+        updateStatus()
+        guard statusTimer==nil else{return}
+        let timer=Timer(timeInterval:1,repeats:true){[weak self] _ in self?.updateStatus()}
+        timer.tolerance=0.2;statusTimer=timer;RunLoop.main.add(timer,forMode:.common)
+    }
+    @objc func refreshAfterActivation(){refreshOnReveal=true;reconcileStatusTimer()}
+    func windowDidChangeOcclusionState(_ notification:Notification){reconcileStatusTimer()}
+    func windowDidBecomeKey(_ notification:Notification){refreshAfterActivation()}
+    func windowDidBecomeMain(_ notification:Notification){reconcileStatusTimer()}
+    func windowDidMiniaturize(_ notification:Notification){reconcileStatusTimer()}
+    func windowDidDeminiaturize(_ notification:Notification){reconcileStatusTimer()}
+    func windowWillClose(_ notification:Notification){closing=true;reconcileStatusTimer();cancelPreview();applyDockPreference()}
     func cancelPreview(){if let state=playingState?(){runTest?(state)}}
-    func present(){applyDockPreference();showWindow(nil);NSApp.activate(ignoringOtherApps:true);window?.makeKeyAndOrderFront(nil)}
-    func updateStatus(){unpluggedSwitch.state=(UserDefaults.standard.object(forKey:"hideWhenUnplugged") as? Bool ?? true) ? .on:.off;loginSwitch.state=SMAppService.mainApp.status == .enabled ? .on:.off;dockSwitch.state=(UserDefaults.standard.object(forKey:"hideFromDock") as? Bool ?? true) ? .on:.off;updateButton.title=UpdateChecker.shared.primaryTitle;updateButton.isEnabled=UpdateChecker.shared.primaryEnabled;cancelUpdate.isHidden = !UpdateChecker.shared.canCancel;updateMessage.stringValue=UpdateChecker.shared.message;activation.state=active?()==true ? .on:.off;let granted=permission?()=="Allowed";permissionStatus.stringValue="Allowed";permissionStatus.isHidden = !granted;permissionButton.isHidden=granted;for row in rows {row.updatePlaying(playingState?()==row.state)}}
+    func present(){closing=false;refreshOnReveal=true;applyDockPreference();showWindow(nil);NSApp.activate(ignoringOtherApps:true);window?.makeKeyAndOrderFront(nil);reconcileStatusTimer()}
+    @objc func updateStatus(){
+        guard statusVisible else{return}
+#if TESTING
+        statusUpdateCount+=1
+#endif
+        let unplugged=(UserDefaults.standard.object(forKey:"hideWhenUnplugged") as? Bool ?? true) ? NSControl.StateValue.on:.off
+        let login: NSControl.StateValue = SMAppService.mainApp.status == .enabled ? .on:.off
+        let dock=(UserDefaults.standard.object(forKey:"hideFromDock") as? Bool ?? true) ? NSControl.StateValue.on:.off
+        let activated: NSControl.StateValue = active?()==true ? .on:.off
+        if unpluggedSwitch.state != unplugged {unpluggedSwitch.state=unplugged}
+        if loginSwitch.state != login {loginSwitch.state=login}
+        if dockSwitch.state != dock {dockSwitch.state=dock}
+        if activation.state != activated {activation.state=activated}
+        let updater=UpdateChecker.shared
+        if updateButton.title != updater.primaryTitle {updateButton.title=updater.primaryTitle}
+        if updateButton.isEnabled != updater.primaryEnabled {updateButton.isEnabled=updater.primaryEnabled}
+        if cancelUpdate.isHidden == updater.canCancel {cancelUpdate.isHidden = !updater.canCancel}
+        if updateMessage.stringValue != updater.message {updateMessage.stringValue=updater.message}
+        let granted=permission?()=="Allowed"
+        if permissionStatus.stringValue != "Allowed" {permissionStatus.stringValue="Allowed"}
+        if permissionStatus.isHidden == granted {permissionStatus.isHidden = !granted}
+        if permissionButton.isHidden != granted {permissionButton.isHidden=granted}
+        let playing=playingState?()
+        for row in rows {row.updatePlaying(playing==row.state)}
+    }
     func refresh(){
         content.subviews.forEach{$0.removeFromSuperview()};rows=[]
         content.addSubview(settingsLabel(["General","States","About"][selected],NSRect(x:28,y:544,width:560,height:34),size:24))
@@ -326,6 +494,13 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var startItem: NSMenuItem!
     var stopItem: NSMenuItem!
     var timer: Timer?
+    private let pollingQueue=DispatchQueue(label:"com.maximkich.magdot.t3",qos:.utility)
+    private let reader=T3Reader()
+    private var pollGeneration=0
+    private var pollInFlight:Int?
+    private var latestMode="system"
+    private var freshness=LEDFreshness()
+    private var lastSentMode=""
     var connectionTimer:Timer?
     var onboardingWindow:NSWindow?
     var onboardingMessage:NSTextField?
@@ -517,7 +692,9 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if mode != "quit", let forced=ProcessInfo.processInfo.environment["MAGDOT_TEST_PRESET"], let value=Int(forced) {p=SequencePreference(preset:value,milliseconds:1600)}
         #endif
         let message = "\(mode) \(Int(Date().timeIntervalSince1970)+4) \(p.preset) \(p.milliseconds)\n"
-        return message.withCString { send(socketFD, $0, strlen($0), 0) == strlen($0) }
+        let sent=message.withCString { send(socketFD, $0, strlen($0), 0) == strlen($0) }
+        if sent {lastSentMode=mode}
+        return sent
     }
     func menuWillOpen(_ menu:NSMenu){
         launchAtStartupItem.isHidden = SMAppService.mainApp.status == .enabled
@@ -548,9 +725,12 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         prepareHelperRegistration()
         #endif
         requested = true; connectorView.isActive = false; menuSwitch.state = .off; startedAt = Date()
+        pollGeneration+=1;pollInFlight=nil;latestMode="system";freshness=LEDFreshness()
         activity = ProcessInfo.processInfo.beginActivity(options: .userInitiatedAllowingIdleSystemSleep, reason: "Maintain the LED restoration heartbeat")
         status.title = "Starting…"; startItem.isEnabled = false; stopItem.isEnabled = true
-        timer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in self?.tick() }
+        // Socket heartbeat runs independently of the serial database reader.
+        timer = Timer(timeInterval: 0.5, repeats: true) { [weak self] _ in self?.tick() }
+        timer?.tolerance=0.05
         RunLoop.main.add(timer!, forMode: .common)
     }
     func connectHelper() -> Bool {
@@ -587,7 +767,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let count = recv(socketFD, &buffer, buffer.count, MSG_DONTWAIT)
         if count > 0 {
             received += String(decoding: buffer.prefix(count), as: UTF8.self)
-            if received.contains("READY\n") && !stopping { ready = true; awaitingHelperApproval=false;connectorView.isActive=true;menuSwitch.state = .on;settingsWindow?.updateStatus() }
+            if received.contains("READY\n") && !stopping && !ready { ready = true; awaitingHelperApproval=false;connectorView.isActive=true;menuSwitch.state = .on;settingsWindow?.updateStatus() }
             if received.contains("RESTORED\n") { restored = true }
             if received.count > 4096 { received = String(received.suffix(4096)) }
         } else if count == 0 { ended(restored); return }
@@ -600,14 +780,12 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
             checkConnection()
             return
         }
-        var mode = "idle", available = true
-        do { let (rows, visits, attention, dismissed) = try readT3(observedTurns:tracker.active); mode = tracker.update(rows, visits: visits, attention: attention, now: Date().timeIntervalSince1970, doneDuration: DoneDuration.seconds, dismissed: dismissed) }
-        catch { available = false }
-        if let testing=testState, ready {mode=testing;available=true}
-        guard sendState(available ? mode : "system") else { ended(false); return }
+        refreshT3()
+        let freshMode=freshness.mode(latestMode,now:ProcessInfo.processInfo.systemUptime)
+        let mode=ready ? (testState ?? freshMode):freshMode
+        guard sendState(mode) else { ended(false); return }
         if ready {
-            let labels = ["idle":"Idle", "working":"Working", "finished":"Finished", "attention":"Needs input"]
-            status.title = available ? labels[mode]! : "T3 unavailable — idle"
+            updateModeLabel(mode)
             if CommandLine.arguments.contains("--smoke-test") || CommandLine.arguments.contains("--quit-smoke") {
                 smokeTicks += 1
                 if smokeTicks == 6 {
@@ -617,7 +795,53 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
         } else if Date().timeIntervalSince(startedAt) > 20 { ended(false, message:"Waiting for background helper") }
     }
+    private func updateModeLabel(_ mode:String){
+        guard ready else{return}
+        let label=["idle":"Idle","working":"Working","finished":"Finished","attention":"Needs input"][mode] ?? "T3 unavailable — idle"
+        if status.title != label {status.title=label}
+    }
+    private func refreshT3(){
+        guard pollInFlight==nil,!sleeping else{return}
+        let generation=pollGeneration,observed=tracker.active,finished=Set(tracker.finished.keys)
+        pollInFlight=generation
+        pollingQueue.async { [weak self] in
+            guard let self else{return}
+            let startedAt=ProcessInfo.processInfo.systemUptime
+#if TESTING
+            let environment=ProcessInfo.processInfo.environment
+            let delayText=environment["MAGDOT_TEST_POLL_DELAY_FILE"].flatMap {try? String(contentsOfFile:$0,encoding:.utf8)} ?? environment["MAGDOT_TEST_POLL_DELAY"]
+            if let delay=delayText.flatMap(Double.init),delay>0 {Thread.sleep(forTimeInterval:delay)}
+#endif
+            let result=Result {try self.reader.read(observedTurns:observed,finishedThreads:finished)}
+            RunLoop.main.perform(inModes:[.common]) { [weak self] in
+                guard let self,self.pollGeneration==generation,self.pollInFlight==generation else{return}
+                self.pollInFlight=nil
+                guard self.requested,!self.stopping,!self.sleeping,!self.quitting else{return}
+                switch result {
+                case .success(let (rows,visits,attention,dismissed)):
+                    guard self.freshness.confirm(startedAt:startedAt,now:ProcessInfo.processInfo.systemUptime) else {
+                        // Do not mutate Tracker with an obsolete snapshot. The
+                        // next poll still observes its outstanding turn IDs.
+                        self.latestMode="system"
+                        if self.testState==nil && self.lastSentMode != "system" {
+                            if !self.sendState("system") {self.ended(false);return}
+                            self.updateModeLabel("system")
+                        }
+                        return
+                    }
+                    self.latestMode=self.tracker.update(rows,visits:visits,attention:attention,now:Date().timeIntervalSince1970,doneDuration:DoneDuration.seconds,dismissed:dismissed)
+                case .failure: self.latestMode="system";self.freshness=LEDFreshness()
+                }
+                let freshMode=self.freshness.mode(self.latestMode,now:ProcessInfo.processInfo.systemUptime)
+                let mode=self.ready ? (self.testState ?? freshMode):freshMode
+                // Deliver a new state without waiting another heartbeat interval.
+                if mode != self.lastSentMode && !self.sendState(mode) {self.ended(false);return}
+                self.updateModeLabel(mode)
+            }
+        }
+    }
     @objc func willSleep() {
+        settingsWindow?.suspended=true
         sleeping = true
         let pending = requested && !stopping ? tracker : unpluggedTracker
         let enabled=connectionGate.activationEnabled
@@ -626,6 +850,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         sleepTracker = pending
     }
     @objc func didWake() {
+        settingsWindow?.suspended=false
         sleeping = false
         guard !requested, !quitting, let pending = sleepTracker else { return }
         sleepTracker = nil
@@ -635,6 +860,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         else {unpluggedTracker=pending}
     }
     @objc func stop() {
+        pollGeneration+=1;pollInFlight=nil
         connectionGate.activationEnabled=false
         awaitingHelperApproval=false
         connectionGate.pendingStart=false
@@ -648,6 +874,8 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         _ = sendState("quit")
     }
     func ended(_ success: Bool, message: String? = nil) {
+        pollGeneration+=1;pollInFlight=nil;latestMode="system";freshness=LEDFreshness()
+        pollingQueue.async { [reader] in reader.close() }
         awaitingHelperApproval=connectionGate.activationEnabled && !quitting
         testState=nil
         timer?.invalidate(); timer = nil
