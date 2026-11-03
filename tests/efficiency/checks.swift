@@ -190,6 +190,7 @@ for hidden in [false,true,false,true] {
  let transitionEnd=Date().addingTimeInterval(0.8)
  while Date()<transitionEnd {
   check(!application.isHidden && settings.window?.isVisible == true && settings.window?.occlusionState.contains(.visible) == true,"Settings never disappears during Dock transition")
+  check(settings.window?.isKeyWindow == true,"Settings keeps keyboard focus throughout Dock transition")
   pump(0.005)
  }
  print("Dock toggle hidden=\(hidden) appHidden=\(application.isHidden) visible=\(settings.window?.isVisible == true) key=\(settings.window?.isKeyWindow == true)")

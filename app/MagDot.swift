@@ -320,9 +320,13 @@ final class CreditLinkField: NSTextField {
         addCursorRect(NSRect(x:prefix+2,y:0,width:width,height:bounds.height),cursor:.pointingHand)
     }
 }
+// A native nonactivating panel keeps its keyboard focus independently of
+// app activation when the Dock policy changes. It uses normal window ordering.
 // AppKit occlusion notifications can arrive after an order-out operation. Stop
 // background UI work synchronously, then reconcile again on reveal/focus events.
-final class SettingsWindow:NSWindow {
+final class SettingsWindow:NSPanel {
+    override var canBecomeKey:Bool {true}
+    override var canBecomeMain:Bool {true}
     var visibilityChanged:(()->Void)?
     override func orderOut(_ sender:Any?){super.orderOut(sender);visibilityChanged?()}
     override func orderFront(_ sender:Any?){super.orderFront(sender);visibilityChanged?()}
@@ -365,7 +369,8 @@ final class SequenceSettings:NSWindowController,NSWindowDelegate,NSTableViewData
     private var refreshOnReveal=true
     var suspended=false {didSet{reconcileStatusTimer()}}
     init(){
-        let w=SettingsWindow(contentRect:NSRect(x:0,y:0,width:860,height:640),styleMask:[.titled,.closable,.miniaturizable,.fullSizeContentView],backing:.buffered,defer:false)
+        let w=SettingsWindow(contentRect:NSRect(x:0,y:0,width:860,height:640),styleMask:[.titled,.closable,.miniaturizable,.fullSizeContentView,.nonactivatingPanel],backing:.buffered,defer:false)
+        w.isFloatingPanel=false;w.hidesOnDeactivate=false
         w.collectionBehavior = [.managed, .primary, .fullScreenNone]
         w.title="MagDot Settings";w.titleVisibility = .hidden;w.titlebarAppearsTransparent=true;w.isReleasedWhenClosed=false
         let toolbar=NSToolbar(identifier:"SettingsHeader");toolbar.showsBaselineSeparator=false;toolbar.allowsUserCustomization=false;w.toolbar=toolbar;w.toolbarStyle = .unified
@@ -515,7 +520,6 @@ final class SequenceSettings:NSWindowController,NSWindowDelegate,NSTableViewData
         dockTransitionGeneration+=1
         let generation=dockTransitionGeneration
         applyDockPreference()
-        NSApp.activate(ignoringOtherApps:true)
         window.makeKeyAndOrderFront(nil)
         DispatchQueue.main.asyncAfter(deadline:.now()+0.5) { [weak self] in
             guard let self, self.dockTransitionGeneration==generation else{return}
