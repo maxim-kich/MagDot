@@ -255,6 +255,12 @@ final class DockVisibilityController {
     private var observers=[NSObjectProtocol]()
     init(){
         let center=NotificationCenter.default
+        observers.append(center.addObserver(forName:NSApplication.didResignActiveNotification,object:nil,queue:.main){[weak self] _ in
+            guard let self, self.transitioning, let window=self.pendingFocusWindow,
+                  window.isVisible, !window.isMiniaturized, window.isOnActiveSpace else{return}
+            // React to the actual policy handoff rather than guessing its duration.
+            NSApp.activate()
+        })
         observers.append(center.addObserver(forName:NSApplication.didBecomeActiveNotification,object:nil,queue:.main){[weak self] _ in
             guard let self, let window=self.pendingFocusWindow else{return}
             self.pendingFocusWindow=nil
