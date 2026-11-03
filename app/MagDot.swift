@@ -261,7 +261,7 @@ final class SequenceRow: NSView {
     let state:String
     let pattern=NSTextField(labelWithString:"")
     let revert=NSButton()
-    let slider=NSSlider(value:1,minValue:0.625,maxValue:2.5,target:nil,action:nil)
+    let slider=NSSlider(value:0.5,minValue:0,maxValue:1,target:nil,action:nil)
     let speed=NSTextField(labelWithString:"")
     let play=NSButton()
     let duration=NSPopUpButton()
@@ -290,9 +290,17 @@ final class SequenceRow: NSView {
     func updatePlaying(_ playing:Bool){guard lastPlaying != playing else{return};lastPlaying=playing;play.image=NSImage(systemSymbolName:playing ? "pause.fill":"play.fill",accessibilityDescription:playing ? "Pause test":"Play test");play.setAccessibilityLabel("\(playing ? "Pause":"Play") \(state) test");play.toolTip=playing ? "Stop preview and resume normal status":"Preview this sequence on the connector"}
     @objc func testSequence(){runTest(state)}
     @objc func changeDuration(){UserDefaults.standard.set(DoneDuration.values[duration.indexOfSelectedItem],forKey:"doneSeconds");refresh()}
-    @objc func changeSpeed(){var p=SequencePreference.load(state);p.milliseconds=max(400,min(1600,Int((Double(SequencePreference.defaults(state).milliseconds)/slider.doubleValue).rounded())));p.save(state);refresh()}
+    @objc func changeSpeed(){
+        var p=SequencePreference.load(state)
+        let base=Double(SequencePreference.defaults(state).milliseconds)
+        let position=slider.doubleValue
+        // Give slower and faster speeds half of the track each, centered on the default.
+        let milliseconds=position<=0.5 ? 1600+(base-1600)*position*2 : base+(400-base)*(position-0.5)*2
+        p.milliseconds=max(400,min(1600,Int(milliseconds.rounded())))
+        p.save(state);refresh()
+    }
     @objc func reset(){SequencePreference.defaults(state).save(state);if state=="finished" {UserDefaults.standard.removeObject(forKey:"doneSeconds")};refresh()}
-    func refresh(){let p=SequencePreference.load(state);let base=Double(SequencePreference.defaults(state).milliseconds);slider.minValue=base/1600;slider.maxValue=base/400;slider.doubleValue=base/Double(p.milliseconds);speed.stringValue=String(format:"Speed  %.2f×",base/Double(p.milliseconds));revert.isHidden=p.milliseconds==Int(base) && (state != "finished" || DoneDuration.seconds==0);if state=="finished" {duration.selectItem(at:DoneDuration.values.firstIndex(of:Int(DoneDuration.seconds)) ?? 5)}}
+    func refresh(){let p=SequencePreference.load(state);let base=Double(SequencePreference.defaults(state).milliseconds);slider.doubleValue=p.milliseconds>=Int(base) ? 0.5*(1600-Double(p.milliseconds))/(1600-base) : 0.5+0.5*(base-Double(p.milliseconds))/(base-400);speed.stringValue=String(format:"Speed  %.2f×",base/Double(p.milliseconds));revert.isHidden=p.milliseconds==Int(base) && (state != "finished" || DoneDuration.seconds==0);if state=="finished" {duration.selectItem(at:DoneDuration.values.firstIndex(of:Int(DoneDuration.seconds)) ?? 5)}}
 
 }
 final class LinkButton: NSButton {
