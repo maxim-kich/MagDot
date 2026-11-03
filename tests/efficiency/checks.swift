@@ -182,6 +182,25 @@ check(settings.statusTimer==nil,"sleep suspension")
 settings.suspended=false
 awaitUI("wake resumes visible Settings timer"){settings.statusTimer != nil}
 check(settings.statusTimer != nil,"wake resumes exactly one timer")
+// AppKit can hide the app asynchronously when removing its Dock icon.
+let savedDockPreference=UserDefaults.standard.object(forKey:"hideFromDock")
+for hidden in [false,true,false,true] {
+ settings.dockSwitch.state=hidden ? .on:.off
+ settings.toggleDock()
+ pump(0.8)
+ print("Dock toggle hidden=\(hidden) appHidden=\(application.isHidden) visible=\(settings.window?.isVisible == true) key=\(settings.window?.isKeyWindow == true)")
+ check(application.activationPolicy() == (hidden ? .accessory:.regular),"Dock preference changes activation policy")
+ check(!application.isHidden && settings.window?.isVisible == true && settings.window?.isKeyWindow == true,"Dock toggle keeps Settings visible and focused after policy transition")
+}
+settings.dockSwitch.state = .off
+settings.toggleDock()
+settings.window?.close()
+pump(0.8)
+check(settings.window?.isVisible == false && settings.statusTimer == nil,"pending Dock restore does not reopen explicitly closed Settings")
+settings.present();pump(0.3)
+if let savedDockPreference {UserDefaults.standard.set(savedDockPreference,forKey:"hideFromDock")}
+else {UserDefaults.standard.removeObject(forKey:"hideFromDock")}
+applyDockPreference()
 // Exercise the real activation actions without registering or contacting a helper.
 let controller=App()
 controller.startItem=NSMenuItem();controller.stopItem=NSMenuItem()
