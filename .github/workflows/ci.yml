@@ -21,6 +21,8 @@ jobs:
           xcrun --show-sdk-version
       - name: Build local validation app (not a distribution release)
         run: scripts/build-app.sh
+      - name: Validate permission and window routing
+        run: scripts/test-permission-flow.sh
       - name: Validate release tooling
         run: |
           python3 -m py_compile scripts/release.py

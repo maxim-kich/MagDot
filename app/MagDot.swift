@@ -479,9 +479,29 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if let path=ProcessInfo.processInfo.environment["MAGDOT_TEST_APPROVAL_FILE"] {
             return (try? String(contentsOfFile:path,encoding:.utf8)) == "enabled"
         }
-        return true
+        return testHelperStatus == .enabled
 #else
         return service.status == .enabled
+#endif
+    }
+#if TESTING
+    var testOnboardingRequired=false
+    var testHelperStatus:SMAppService.Status = .enabled
+    var testRegisterHelper:(() throws -> Void)?
+    var testOpenLoginItems:(()->Void)?
+#endif
+    var helperStatus:SMAppService.Status {
+#if TESTING
+        return testHelperStatus
+#else
+        return service.status
+#endif
+    }
+    var onboardingRequired:Bool {
+#if TESTING
+        return testOnboardingRequired
+#else
+        return !UserDefaults.standard.bool(forKey:"magSafeOnboardingCompleted") && !CommandLine.arguments.contains("--render-settings")
 #endif
     }
     let service = SMAppService.daemon(plistName: "com.maximkich.magdot.helper.plist")
@@ -533,6 +553,13 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if !requested {testState=nil}
     }
     @objc func showSettings(){
+        if onboardingRequired {
+            updateOnboarding()
+            onboardingWindow?.deminiaturize(nil)
+            NSApp.activate(ignoringOtherApps:true)
+            onboardingWindow?.makeKeyAndOrderFront(nil)
+            return
+        }
         if settingsWindow == nil {
             let settings=SequenceSettings();settingsWindow=settings
             settings.visibilityChanged={ [weak self] in self?.updateConnectionVisibility() }
@@ -542,12 +569,11 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
             settings.setActive={ [weak self] on in if on {self?.start()} else {self?.stop()} }
             settings.permission={ [weak self] in
                 guard let self else{return "Unavailable"}
-                switch self.service.status {case .enabled:return "Allowed";case .requiresApproval:return "Approval needed in System Settings";case .notRegistered,.notFound:return "Not registered";@unknown default:return "Unavailable"}
+                switch self.helperStatus {case .enabled:return "Allowed";case .requiresApproval:return "Approval needed in System Settings";case .notRegistered,.notFound:return "Not registered";@unknown default:return "Unavailable"}
             }
             settings.managePermission={ [weak self] in
                 guard let self else{return}
-                self.prepareHelperRegistration(explicit:true)
-                self.start();SMAppService.openSystemSettingsLoginItems()
+                self.manageHelperPermission()
             }
         };settingsWindow?.present()
     }
@@ -616,8 +642,8 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
     func updateOnboarding(){
-#if !TESTING
-        guard !UserDefaults.standard.bool(forKey:"magSafeOnboardingCompleted") else{return}
+        guard onboardingRequired else{return}
+        settingsWindow?.window?.orderOut(nil)
         if onboardingWindow == nil {
             let window=NSWindow(contentRect:NSRect(x:0,y:0,width:480,height:170),styleMask:[.titled,.closable],backing:.buffered,defer:false)
             window.title="Welcome to MagDot";window.isReleasedWhenClosed=false;window.center()
@@ -639,11 +665,14 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         onboardingMessage?.stringValue=connected ? "MagSafe 3 connected" : "Connect your MagSafe 3 cable"
         onboardingMessage?.textColor=connected ? .systemGreen : .labelColor
         onboardingDoneButton?.isEnabled=connected
-#endif
     }
     @objc func dismissOnboarding(){
         guard magSafeConnection() == true else {updateOnboarding();return}
+#if TESTING
+        testOnboardingRequired=false
+#else
         UserDefaults.standard.set(true,forKey:"magSafeOnboardingCompleted")
+#endif
         onboardingWindow?.close();onboardingWindow=nil
     }
     func updateConnectionVisibility(){
@@ -721,9 +750,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         #if TESTING
         if ProcessInfo.processInfo.environment["MAGDOT_TEST_REGISTER_DEFER"] == "1" && !serviceEnabled {return}
         #endif
-        #if !TESTING
         prepareHelperRegistration()
-        #endif
         requested = true; connectorView.isActive = false; menuSwitch.state = .off; startedAt = Date()
         pollGeneration+=1;pollInFlight=nil;latestMode="system";freshness=LEDFreshness()
         activity = ProcessInfo.processInfo.beginActivity(options: .userInitiatedAllowingIdleSystemSleep, reason: "Maintain the LED restoration heartbeat")
@@ -892,13 +919,39 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if !quitting && !sleeping && sleepTracker != nil { didWake() }
         if quitting { print("Quit restoration acknowledged=\(success)"); NSApp.reply(toApplicationShouldTerminate: true) }
     }
+    func manageHelperPermission() {
+        // Choose from the status BEFORE registration. Registration can initiate
+        // system approval UI; never force Settings navigation in the same action.
+        switch helperStatus {
+        case .notRegistered, .notFound:
+            prepareHelperRegistration(explicit:true)
+        case .requiresApproval:
+#if TESTING
+            testOpenLoginItems?()
+#else
+            SMAppService.openSystemSettingsLoginItems()
+#endif
+        case .enabled: break
+        @unknown default: return
+        }
+        start()
+        settingsWindow?.updateStatus()
+    }
     func prepareHelperRegistration(explicit:Bool=false) {
         // Connection retries must never register/unregister a launchd job again.
         guard explicit || !helperRegistrationAttempted else{return}
         helperRegistrationAttempted=true
         do {
-            if service.status == .notRegistered || service.status == .notFound {try service.register()}
+            if helperStatus == .notRegistered || helperStatus == .notFound {
+#if TESTING
+                try testRegisterHelper?()
+#else
+                try service.register()
+#endif
+            }
+#if !TESTING
             UserDefaults.standard.set("socket-v1",forKey:"helperRegistrationVersion")
+#endif
         } catch {
             status.title="Helper setup needs attention"
             status.toolTip=error.localizedDescription
