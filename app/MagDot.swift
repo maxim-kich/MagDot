@@ -359,6 +359,8 @@ final class SequenceSettings:NSWindowController,NSWindowDelegate,NSTableViewData
 #if TESTING
     private(set) var statusUpdateCount=0
 #endif
+    private var dockTransitionGeneration=0
+    private var dockTransitionCanHide:Bool?
     private var closing=false
     private var refreshOnReveal=true
     var suspended=false {didSet{reconcileStatusTimer()}}
@@ -505,14 +507,20 @@ final class SequenceSettings:NSWindowController,NSWindowDelegate,NSTableViewData
     @objc func toggleUnplugged(){UserDefaults.standard.set(unpluggedSwitch.state == .on,forKey:"hideWhenUnplugged");visibilityChanged?()}
     @objc func toggleDock(){
         UserDefaults.standard.set(dockSwitch.state == .on,forKey:"hideFromDock")
+        guard let window else {applyDockPreference();return}
+        // Protect the existing window from AppKit's implicit hide while the
+        // activation policy changes. Never hide and then reactivate the app.
+        if dockTransitionCanHide == nil {dockTransitionCanHide=window.canHide}
+        window.canHide=false
+        dockTransitionGeneration+=1
+        let generation=dockTransitionGeneration
         applyDockPreference()
-        // Removing the Dock icon can hide the app after setActivationPolicy returns.
-        // Allow AppKit to finish the Dock transition before restoring Settings.
-        DispatchQueue.main.asyncAfter(deadline:.now()+0.2) { [weak self] in
-            guard let self, !self.closing, let window=self.window, !window.isMiniaturized else{return}
-            NSApp.unhide(nil)
-            NSApp.activate(ignoringOtherApps:true)
-            window.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps:true)
+        window.makeKeyAndOrderFront(nil)
+        DispatchQueue.main.asyncAfter(deadline:.now()+0.5) { [weak self] in
+            guard let self, self.dockTransitionGeneration==generation else{return}
+            if let canHide=self.dockTransitionCanHide {self.window?.canHide=canHide}
+            self.dockTransitionCanHide=nil
             self.reconcileStatusTimer()
         }
     }

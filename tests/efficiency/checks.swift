@@ -187,11 +187,20 @@ let savedDockPreference=UserDefaults.standard.object(forKey:"hideFromDock")
 for hidden in [false,true,false,true] {
  settings.dockSwitch.state=hidden ? .on:.off
  settings.toggleDock()
- pump(0.8)
+ let transitionEnd=Date().addingTimeInterval(0.8)
+ while Date()<transitionEnd {
+  check(!application.isHidden && settings.window?.isVisible == true && settings.window?.occlusionState.contains(.visible) == true,"Settings never disappears during Dock transition")
+  pump(0.005)
+ }
  print("Dock toggle hidden=\(hidden) appHidden=\(application.isHidden) visible=\(settings.window?.isVisible == true) key=\(settings.window?.isKeyWindow == true)")
  check(application.activationPolicy() == (hidden ? .accessory:.regular),"Dock preference changes activation policy")
  check(!application.isHidden && settings.window?.isVisible == true && settings.window?.isKeyWindow == true,"Dock toggle keeps Settings visible and focused after policy transition")
 }
+check(settings.window?.canHide == true,"Dock transition restores normal window hiding")
+application.hide(nil)
+awaitUI("normal app Hide still works after Dock toggles"){application.isHidden}
+application.unhide(nil);settings.window?.makeKeyAndOrderFront(nil)
+awaitUI("Settings recovers from normal Hide"){!application.isHidden && settings.statusTimer != nil}
 settings.dockSwitch.state = .off
 settings.toggleDock()
 settings.window?.close()
