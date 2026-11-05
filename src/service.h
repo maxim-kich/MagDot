@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-License-Identifier: MIT
 // Root service accepts only the signed MagDot app from our own signing team.
 #include <Security/Security.h>
 #include <sys/socket.h>

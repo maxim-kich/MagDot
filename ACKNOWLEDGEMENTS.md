@@ -4,7 +4,9 @@ MagDot uses the following open-source components, macOS technologies, and resear
 
 ## MagDot
 
-MagDot's source code is licensed under [GNU GPL v3 only](LICENSE). The matching source archive accompanies each published release.
+MagDot's own source code is licensed under the [MIT License](LICENSE), copyright (c) 2026 Maxim Kich. Third-party components retain their own licenses below.
+
+Previously published releases, including 0.0.1 and 0.0.2, were distributed under GPL-3.0-only; their original artifacts and notices are unchanged. This change applies to the current source tree and future builds. See the [relicensing audit](docs/RELICENSING.md).
 
 ## Sparkle — in-app updates
 

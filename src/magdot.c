@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-License-Identifier: MIT
 // AppleSMC ABI informed by kamenlevi/MagHue and Weta-Technologies/JuiceLeft.
 #include <IOKit/IOKitLib.h>
 #include <CoreFoundation/CoreFoundation.h>

@@ -1,5 +1,5 @@
 import Carbon
-// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-License-Identifier: MIT
 import AppKit
 import SQLite3
 import Darwin
@@ -571,7 +571,7 @@ final class SequenceSettings:NSWindowController,NSWindowDelegate,NSTableViewData
             cancelUpdate.target=self;cancelUpdate.action = #selector(cancelDownload);cancelUpdate.bezelStyle = .rounded;cancelUpdate.frame=NSRect(x:408,y:79,width:88,height:32);c.addSubview(cancelUpdate)
             updateMessage.font = .systemFont(ofSize:11);updateMessage.textColor = .secondaryLabelColor;updateMessage.alignment = .center;updateMessage.frame=NSRect(x:24,y:43,width:544,height:32);c.addSubview(updateMessage)
             let credit=CreditLinkField(labelWithString:"");credit.frame=NSRect(x:28,y:110,width:300,height:22);credit.isSelectable=true;credit.allowsEditingTextAttributes=true
-            let text=NSMutableAttributedString(string:"Created by Maxim Kich",attributes:[.font:NSFont.systemFont(ofSize:11),.foregroundColor:NSColor.secondaryLabelColor]);text.addAttribute(.link,value:URL(string:"https://maximkich.com")!,range:(text.string as NSString).range(of:"Maxim Kich"));credit.attributedStringValue=text;content.addSubview(credit)
+            let text=NSMutableAttributedString(string:"Created by Maxim Kich · MIT License",attributes:[.font:NSFont.systemFont(ofSize:11),.foregroundColor:NSColor.secondaryLabelColor]);text.addAttribute(.link,value:URL(string:"https://maximkich.com")!,range:(text.string as NSString).range(of:"Maxim Kich"));credit.attributedStringValue=text;content.addSubview(credit)
             let license=LinkButton(title:"Licenses",target:self,action:#selector(openLicense));license.isBordered=false;license.attributedTitle=NSAttributedString(string:"Licenses",attributes:[.font:NSFont.systemFont(ofSize:11),.foregroundColor:NSColor.secondaryLabelColor]);license.frame=NSRect(x:530,y:111,width:80,height:22);content.addSubview(license)
 
         };updateStatus()
@@ -594,7 +594,10 @@ final class SequenceSettings:NSWindowController,NSWindowDelegate,NSTableViewData
     @objc func checkUpdate(){UpdateChecker.shared.openUpdate()}
     @objc func cancelDownload(){UpdateChecker.shared.cancel()}
     @objc func openProject(){NSWorkspace.shared.open(URL(string:"https://github.com/maxim-kich/MagDot")!)}
-    @objc func openLicense(){NSWorkspace.shared.open(URL(string:"https://github.com/maxim-kich/MagDot/blob/main/ACKNOWLEDGEMENTS.md")!)}
+    @objc func openLicense(){
+        guard let resources=Bundle.main.resourceURL else {return}
+        NSWorkspace.shared.open(resources.appendingPathComponent("Legal",isDirectory:true))
+    }
 }
 
 final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {

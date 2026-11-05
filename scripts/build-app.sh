@@ -14,6 +14,9 @@ xcrun swiftc -swift-version 5 -target arm64-apple-macos14.0 -O build/main.swift 
 cp build/magdot "$APP/Contents/Resources/magdot"
 ./scripts/build-icon.sh "$APP"
 cp LICENSE "$APP/Contents/Resources/LICENSE"
+mkdir -p "$APP/Contents/Resources/Legal"
+cp LICENSE "$APP/Contents/Resources/Legal/MagDot-MIT-LICENSE.txt"
+cp ACKNOWLEDGEMENTS.md "$APP/Contents/Resources/Legal/ACKNOWLEDGEMENTS.md"
 cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
