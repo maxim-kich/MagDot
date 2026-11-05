@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-License-Identifier: MIT
 // Adapted from the author's DragTwoZero updater.
 import AppKit
 import Sparkle

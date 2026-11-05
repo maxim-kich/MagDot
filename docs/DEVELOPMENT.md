@@ -67,7 +67,7 @@ The service test builds a **compile-time fake SMC** and uses an isolated tempora
 
 `tests/hardware.py` is an opt-in administrator test that really writes the LED via the controller. Do not run it during an active app session.
 
-Protocol sources: [MagHue](https://github.com/kamenlevi/MagHue/blob/main/Sources/MagHueCore/SMC.swift) and [JuiceLeft](https://github.com/Weta-Technologies/JuiceLeft/blob/main/juiceleft-led.c). MagDot uses GPL-3.0-only.
+Protocol sources: [MagHue](https://github.com/kamenlevi/MagHue/blob/main/Sources/MagHueCore/SMC.swift) and [JuiceLeft](https://github.com/Weta-Technologies/JuiceLeft/blob/main/juiceleft-led.c). MagDot's own code uses MIT; these references retain their original terms. See the [provenance audit](RELICENSING.md).
 
 ## Sequence settings
 

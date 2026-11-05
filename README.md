@@ -41,4 +41,4 @@ Unplugging pauses tracking. Reconnecting resumes it if Activate was on; a manual
 
 MagDot currently supports only T3 Code agents. Compatibility depends on T3’s internal database, and MagSafe behavior needs verification on additional Mac models. Brightness dimming and red are not supported. Quit other utilities controlling the same LED. Restarting MagDot clears pending Done notifications.
 
-[Development and testing](docs/DEVELOPMENT.md) · [Contributing](CONTRIBUTING.md) · [GPL-3.0 license](LICENSE) · [Acknowledgements](ACKNOWLEDGEMENTS.md)
+[Development and testing](docs/DEVELOPMENT.md) · [Contributing](CONTRIBUTING.md) · [MIT license](LICENSE) · [Acknowledgements](ACKNOWLEDGEMENTS.md)

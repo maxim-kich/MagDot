@@ -10,6 +10,10 @@ ditto /Applications/MagDot.app "$APP"
 cp app/MagDot.swift build/main.swift
 xcrun swiftc -swift-version 5 -target arm64-apple-macos14.0 -O build/main.swift app/UpdateChecker.swift app/InAppUpdater.swift -F build/sparkle/Sparkle.xcframework/macos-arm64_x86_64 -framework Sparkle -Xlinker -rpath -Xlinker @executable_path/../Frameworks -framework AppKit -framework ServiceManagement -lsqlite3 -o "$APP/Contents/MacOS/MagDot"
 ./scripts/build-icon.sh "$APP"
+cp LICENSE "$APP/Contents/Resources/LICENSE"
+mkdir -p "$APP/Contents/Resources/Legal"
+cp LICENSE "$APP/Contents/Resources/Legal/MagDot-MIT-LICENSE.txt"
+cp ACKNOWLEDGEMENTS.md "$APP/Contents/Resources/Legal/ACKNOWLEDGEMENTS.md"
 if [ "$(python3 scripts/thin-sparkle.py "$APP")" = changed ]; then
   scripts/sign-sparkle.sh "$APP" "$SIGN_IDENTITY" development
 fi
