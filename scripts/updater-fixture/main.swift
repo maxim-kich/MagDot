@@ -10,6 +10,8 @@ final class Fixture: NSObject, NSApplicationDelegate {
     var handledReady = false
     var cancelledDownload = false
     var consent = false
+    var preparations=0
+    var vetoed=false
     var report: URL { URL(fileURLWithPath: Bundle.main.infoDictionary!["FixtureReport"] as! String) }
     var mode: String { Bundle.main.infoDictionary!["FixtureMode"] as! String }
     func record(_ event: String) {
@@ -31,6 +33,8 @@ final class Fixture: NSObject, NSApplicationDelegate {
             require(UserDefaults.standard.string(forKey: "fixtureSetting") == "preserved", "settings preserved")
             require(!UserDefaults.standard.bool(forKey: "checkForUpdates"), "daily preference preserved")
             require(UserDefaults.standard.object(forKey: "SUUpdateGroupIdentifier") == nil, "no installation identifier")
+            require(UpdateRelaunch.consume() == (mode != "off"), "one-shot original activation intent restored")
+            require(UpdateRelaunch.consume() == nil, "relaunch receipt consumed once")
             record("SUCCESS replaced and relaunched 9.0.1 -> 9.0.2")
             NSApp.terminate(nil); return
         }
@@ -41,6 +45,32 @@ final class Fixture: NSObject, NSApplicationDelegate {
             return self.consent
         })
         checker.activity = { [unowned self] in self.activity }
+        activity.activationIntent = mode != "off"
+        activity.controllingLED = mode != "off"
+        checker.beforeRestart = { [unowned self] stillAuthorized, completion in
+            preparations += 1
+            record("PREPARE " + String(preparations))
+            require(!checker.permitsTermination(), "quit blocked while preparing")
+            if mode == "prepare-failure" && preparations == 1 {
+                activity.controllingLED=false; activity.activationIntent=false
+                completion(false)
+                require(!checker.restartAuthorized, "failed preparation never authorizes install")
+                require(UserDefaults.standard.object(forKey: UpdateRelaunch.key) == nil, "failed preparation leaves no receipt")
+                DispatchQueue.main.async { self.checker.openUpdate() }
+                return
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
+                if self.mode == "stop-cancel" { self.checker.cancel() }
+                self.record("RESTORATION acknowledged")
+                self.activity.controllingLED=false; self.activity.activationIntent=false
+                completion(true)
+                if self.mode == "stop-cancel" {
+                    self.require(!self.checker.restartAuthorized, "late stop cannot install after cancel")
+                    self.require(UserDefaults.standard.object(forKey: UpdateRelaunch.key) == nil, "cancel leaves no relaunch receipt")
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 1) { self.finishCancellation() }
+                }
+            }
+        }
         observer = NotificationCenter.default.addObserver(forName: UpdateChecker.changed, object: checker, queue: .main) { [weak self] _ in
             DispatchQueue.main.async { self?.advance() }
         }
@@ -66,11 +96,6 @@ final class Fixture: NSObject, NSApplicationDelegate {
         case .ready where !handledReady:
             handledReady = true
             require(!checker.permitsTermination(), "ordinary quit blocked before restart consent")
-            activity.controllingLED = true; checker.openUpdate()
-            require(checker.phase == .ready && !checker.restartAuthorized, "active LED control blocks restart")
-            activity.controllingLED = false; activity.controllingLED = true; checker.openUpdate()
-            require(checker.phase == .ready && !checker.restartAuthorized, "LED control blocks restart")
-            activity.controllingLED = false
             if mode == "staged-cancel" {
                 checker.cancel()
                 DispatchQueue.main.asyncAfter(deadline: .now() + 1) { self.finishCancellation() }
@@ -99,6 +124,17 @@ final class Fixture: NSObject, NSApplicationDelegate {
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         guard let checker else { return .terminateNow }
         let allowed = checker.permitsTermination()
+        if allowed && mode == "termination-retry" && !vetoed {
+            vetoed=true
+            record("QUIT injected veto")
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1) {
+                self.require(self.checker.primaryEnabled, "termination retry offered")
+                self.consent=false; self.checker.openUpdate()
+                self.require(self.preparations == 1, "declining retry does not prepare again")
+                self.consent=true; self.checker.openUpdate()
+            }
+            return .terminateCancel
+        }
         record(allowed ? "QUIT allowed" : "QUIT blocked")
         return allowed ? .terminateNow : .terminateCancel
     }
