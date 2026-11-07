@@ -208,7 +208,8 @@ final class T3Reader {
             // Read runs, not provider turns: provider completion can precede parent-run
             // completion, and stale provider records can outlive cancelled/failed runs.
             // Never select only the latest ordinal: a newer request can be queued/cancelled.
-            let runs=try rows("SELECT r.run_id,r.thread_id,r.status,COALESCE(json_extract(r.payload_json,'$.startedAt'),r.requested_at),r.completed_at FROM orchestration_v2_projection_runs r JOIN orchestration_v2_projection_threads t USING(thread_id) WHERE t.deleted_at IS NULL AND t.archived_at IS NULL AND \(eligibleThread) AND (r.run_id IN (\(marks)) OR r.status IN ('preparing','starting','running','waiting') OR r.completed_at > strftime('%Y-%m-%dT%H:%M:%fZ','now','-130 seconds'))",observed)
+            // Missing startedAt is not a start: cancelled queued requests must retain unread Done.
+            let runs=try rows("SELECT r.run_id,r.thread_id,r.status,json_extract(r.payload_json,'$.startedAt'),r.completed_at FROM orchestration_v2_projection_runs r JOIN orchestration_v2_projection_threads t USING(thread_id) WHERE t.deleted_at IS NULL AND t.archived_at IS NULL AND \(eligibleThread) AND (r.run_id IN (\(marks)) OR r.status IN ('preparing','starting','running','waiting') OR r.completed_at > strftime('%Y-%m-%dT%H:%M:%fZ','now','-130 seconds'))",observed)
             // A completion observed on this poll must be dismissible on this poll too.
             let relevant=finishedThreads.union(runs.filter {observedRuns.contains($0[0]) && $0[2]=="completed"}.map{$0[1]}).sorted()
             var visits=[String:Double]()

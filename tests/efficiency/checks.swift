@@ -160,7 +160,7 @@ var longTracker=Tracker()
 snapshot=try reader.read()
 check(Set(snapshot.0.map(\.id))==["active-a","active-b"],"older active runs survive newer queued/cancelled requests; subagent excluded")
 check(snapshot.0.first{$0.id=="active-a"}?.started==date+1,"run startedAt lifecycle metadata read")
-check(snapshot.0.first{$0.id=="active-b"}?.started==date,"missing startedAt falls back to requestedAt")
+check(snapshot.0.first{$0.id=="active-b"}?.started==0,"missing startedAt does not imply work started")
 for elapsed in [3599.0,3600,7200,172800] {
     check(longTracker.update(snapshot.0,visits:[:],attention:false,now:date+elapsed,doneDuration:0)=="working","parents remain Working at \(elapsed)s without a fresh diagnostic run")
     check(longTracker.active==["active-a","active-b"],"both long-running parents tracked")
@@ -228,6 +228,46 @@ do {_ = try reader.read();preconditionFailure("missing runs must not fall back t
 try exec("ALTER TABLE saved_runs RENAME TO orchestration_v2_projection_runs")
 check(try reader.read().0.isEmpty,"run schema recovery does not revive stale providers")
 print("Long-lived active parents, queued/cancelled successors, terminal stale providers, full-run completion, overlap and schema recovery passed")
+// A queued successor can end without ever starting. Its recent completion
+// timestamp brings it into the query, but request time must not dismiss Done.
+try exec("DELETE FROM orchestration_v2_projection_runtime_requests")
+try exec("DELETE FROM orchestration_v2_projection_runs")
+let wallNow=Date().timeIntervalSince1970
+let formatter=ISO8601DateFormatter()
+func stamp(_ offset:Double)->String {formatter.string(from:Date(timeIntervalSince1970:wallNow+offset))}
+for metadata in ["{}", "{\"startedAt\":null}"] {
+    for terminal in ["cancelled","failed"] {
+        try exec("DELETE FROM orchestration_v2_projection_runs")
+        try exec("INSERT INTO orchestration_v2_projection_runs(run_id,thread_id,status,requested_at,payload_json) VALUES('unread','long-a','running','\(stamp(-120))','{\"startedAt\":\"\(stamp(-110))\"}')")
+        var retained=Tracker()
+        snapshot=try reader.read()
+        check(retained.update(snapshot.0,visits:snapshot.1,attention:snapshot.2,now:wallNow,doneDuration:0)=="working","observe predecessor")
+        try exec("UPDATE orchestration_v2_projection_runs SET status='completed',completed_at='\(stamp(-90))' WHERE run_id='unread'")
+        snapshot=try reader.read(observedRuns:retained.active)
+        check(retained.update(snapshot.0,visits:snapshot.1,attention:snapshot.2,now:wallNow,doneDuration:0)=="finished","predecessor Done remains unread")
+        _ = try reader.read(finishedThreads:["long-a"])
+        try exec("INSERT INTO orchestration_v2_projection_runs(run_id,thread_id,status,requested_at,completed_at,payload_json) VALUES('unstarted','long-a','\(terminal)','\(stamp(-60))','\(stamp(-30))','\(metadata)')")
+        snapshot=try reader.read(finishedThreads:["long-a"])
+        check(snapshot.0.contains{$0.id=="unstarted"},"recent \(terminal) successor included in real reader query")
+        check(retained.update(snapshot.0,visits:snapshot.1,attention:snapshot.2,now:wallNow,doneDuration:0,dismissed:snapshot.3)=="finished","never-started \(terminal) successor with \(metadata) preserves unread Done")
+        // Cached reads preserve it too; a later actual start still clears it,
+        // even if that successor ended entirely between MagDot polls.
+        snapshot=try reader.read(finishedThreads:["long-a"])
+        check(retained.update(snapshot.0,visits:snapshot.1,attention:snapshot.2,now:wallNow+1,doneDuration:0)=="finished","cached unstarted successor preserves Done")
+        let pending=retained
+        try exec("UPDATE orchestration_v2_projection_runs SET payload_json='{\"startedAt\":\"\(stamp(-50))\"}' WHERE run_id='unstarted'")
+        snapshot=try reader.read(finishedThreads:["long-a"])
+        check(retained.update(snapshot.0,visits:snapshot.1,attention:snapshot.2,now:wallNow+2,doneDuration:0)=="idle","actually started terminal successor still clears previous Done")
+        for status in ["preparing","starting","running","waiting"] {
+            var activeSuccessor=pending
+            try exec("UPDATE orchestration_v2_projection_runs SET status='\(status)',completed_at=NULL,payload_json='\(metadata)' WHERE run_id='unstarted'")
+            snapshot=try reader.read(finishedThreads:["long-a"])
+            check(activeSuccessor.update(snapshot.0,visits:snapshot.1,attention:snapshot.2,now:wallNow+3,doneDuration:0)=="working" && activeSuccessor.finished.isEmpty,"active \(status) successor clears Done without startedAt")
+        }
+    }
+}
+try exec("DELETE FROM orchestration_v2_projection_runs")
+print("Recent never-started cancelled/failed successors retain unread Done; actual starts and active lifecycle still clear it")
 try exec("DROP TABLE orchestration_v2_projection_runtime_requests")
 do {_ = try reader.read();preconditionFailure("schema failure must surface")}catch{}
 try exec("CREATE TABLE orchestration_v2_projection_runtime_requests(thread_id TEXT,resolved_at TEXT,status TEXT,kind TEXT)")
