@@ -43,11 +43,13 @@ Do not run manual LED commands while the app has an active session. All controll
 
 ## T3 integration
 
-The app opens `~/.t3/userdata/statev2.sqlite` read-only and reads only lifecycle metadata from the v2 projections: turn IDs, status/timestamps, thread archive/delete state, `lastVisitedAt`, `snoozedUntil`, `settledOverride`, and request kind/status. It does not query message or request bodies, tokens, or credentials.
+The app opens `~/.t3/userdata/statev2.sqlite` read-only and reads only lifecycle metadata from the v2 projections: run IDs, status/timestamps, thread archive/delete state, `lastVisitedAt`, `snoozedUntil`, `settledOverride`, and request kind/status. It does not query message or request bodies, tokens, or credentials.
 
 Only user-facing threads contribute status. Threads whose `lineage.relationshipToParent` is `subagent` are excluded from Working, Done, and Input; ordinary forks and threads without lineage metadata remain eligible.
 
-This is an internal-schema adapter, not a supported T3 public API. A running turn expires after one hour; there is no arbitrary one-hour app-session limit. Old completions are suppressed on startup. Cancellation/failure clears that turn; other threads may still determine the LED state. Schema/read errors temporarily return control to macOS without discarding pending completions. Done is cleared when the completed thread is marked read (`lastVisitedAt` at or after completion), snoozed, settled, archived, or deleted. App focus and lid state do not acknowledge a thread. The `user_input` kind was observed in the live database; approval/permission filters are provisional until observed against a real pending approval.
+This is an internal-schema adapter, not a supported T3 public API. Working follows T3 parent runs in `preparing`, `starting`, `running`, or `waiting`, without an elapsed-time cutoff. Newer queued or cancelled requests do not mask an older active run. Provider-turn records are not used for liveness: they can outlive terminated runs or complete before the full parent run. Done follows an observed parent run reaching `completed`, and is suppressed while another run in that same thread is active.
+
+Old completions are suppressed on startup. Cancellation, failure, interruption, or rollback clears that run; other threads may still determine the LED state. Schema/read errors temporarily return control to macOS without discarding pending completions. Done is cleared when the completed thread is marked read (`lastVisitedAt` at or after completion), snoozed, settled, archived, or deleted. App focus and lid state do not acknowledge a thread. The `user_input` kind was observed in the live database; approval/permission filters are provisional until observed against a real pending approval.
 
 ## Restoration and limits
 

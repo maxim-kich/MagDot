@@ -7,8 +7,10 @@ with tempfile.TemporaryDirectory(prefix='md-fresh-') as folder:
     db=sqlite3.connect(root/'fixture.sqlite')
     db.executescript('''PRAGMA journal_mode=WAL;
     CREATE TABLE orchestration_v2_projection_threads(thread_id TEXT PRIMARY KEY,payload_json TEXT,deleted_at TEXT,archived_at TEXT);
-    CREATE TABLE orchestration_v2_projection_provider_turns(provider_turn_id TEXT PRIMARY KEY,thread_id TEXT,status TEXT,started_at TEXT,completed_at TEXT);
+    CREATE TABLE orchestration_v2_projection_runs(run_id TEXT PRIMARY KEY,thread_id TEXT,status TEXT,requested_at TEXT,completed_at TEXT,payload_json TEXT DEFAULT '{}');
     CREATE TABLE orchestration_v2_projection_runtime_requests(thread_id TEXT,resolved_at TEXT,status TEXT,kind TEXT);
+    CREATE TABLE orchestration_v2_projection_provider_turns(provider_turn_id TEXT PRIMARY KEY,thread_id TEXT,status TEXT,started_at TEXT,completed_at TEXT);
+    INSERT INTO orchestration_v2_projection_provider_turns VALUES('stale','chat','running','2026-01-01T00:00:00Z',NULL);
     INSERT INTO orchestration_v2_projection_threads VALUES('chat','{}',NULL,NULL);
     ''')
     delay=root/'delay';delay.write_text('0')
@@ -45,30 +47,30 @@ with tempfile.TemporaryDirectory(prefix='md-fresh-') as folder:
             if matches:return min(matches)-after
             time.sleep(.005)
         raise AssertionError(f'{mode} not delivered within {timeout}s; events={events[-8:]}')
-    def stamp():return datetime.datetime.now(datetime.timezone.utc).isoformat(timespec='milliseconds').replace('+00:00','Z')
+    def stamp(age=0):return (datetime.datetime.now(datetime.timezone.utc)-datetime.timedelta(seconds=age)).isoformat(timespec='milliseconds').replace('+00:00','Z')
     def change(sql,params,mode):
         db.execute(sql,params);db.commit();committed=time.monotonic()
         latencies.append(wait_mode(mode,committed))
     try:
         wait_mode('idle',time.monotonic(),3)
-        change('INSERT INTO orchestration_v2_projection_provider_turns VALUES(?,?,?,?,?)',('one','chat','running',stamp(),None),'working')
-        change("UPDATE orchestration_v2_projection_provider_turns SET status='completed',completed_at=? WHERE provider_turn_id='one'",(stamp(),),'finished')
+        change('INSERT INTO orchestration_v2_projection_runs(run_id,thread_id,status,requested_at,completed_at) VALUES(?,?,?,?,?)',('one','chat','running',stamp(age=7200),None),'working')
+        change("UPDATE orchestration_v2_projection_runs SET status='completed',completed_at=? WHERE run_id='one'",(stamp(),),'finished')
         change('INSERT INTO orchestration_v2_projection_runtime_requests VALUES(?,?,?,?)',('chat',None,'pending','approval'),'attention')
         change("UPDATE orchestration_v2_projection_runtime_requests SET resolved_at='yes'",(),'finished')
-        change('INSERT INTO orchestration_v2_projection_provider_turns VALUES(?,?,?,?,?)',('two','chat','running',stamp(),None),'working')
-        change("UPDATE orchestration_v2_projection_provider_turns SET status='cancelled',completed_at=? WHERE provider_turn_id='two'",(stamp(),),'idle')
+        change('INSERT INTO orchestration_v2_projection_runs(run_id,thread_id,status,requested_at,completed_at) VALUES(?,?,?,?,?)',('two','chat','running',stamp(),None),'working')
+        change("UPDATE orchestration_v2_projection_runs SET status='cancelled',completed_at=? WHERE run_id='two'",(stamp(),),'idle')
         change("UPDATE orchestration_v2_projection_runtime_requests SET resolved_at=NULL",(),'attention')
         change("UPDATE orchestration_v2_projection_runtime_requests SET resolved_at='yes'",(),'idle')
-        change('INSERT INTO orchestration_v2_projection_provider_turns VALUES(?,?,?,?,?)',('three','chat','running',stamp(),None),'working')
+        change('INSERT INTO orchestration_v2_projection_runs(run_id,thread_id,status,requested_at,completed_at) VALUES(?,?,?,?,?)',('three','chat','running',stamp(),None),'working')
         delay.write_text('3');blocked=time.monotonic()
         wait_mode('system',blocked,2.5)
         # Even when an old background request returns, it must not re-arm working.
         time.sleep(3.2)
         assert all(state=='system' for t,state in events if t>blocked+2.5),events[-12:]
-        db.execute("UPDATE orchestration_v2_projection_provider_turns SET status='cancelled',completed_at=? WHERE provider_turn_id='three'",(stamp(),));db.commit()
+        db.execute("UPDATE orchestration_v2_projection_runs SET status='cancelled',completed_at=? WHERE run_id='three'",(stamp(),));db.commit()
         delay.write_text('0')
         wait_mode('idle',time.monotonic(),4.5)
         print(f'{len(latencies)} committed transitions: max app-to-socket delay {max(latencies)*1000:.0f}ms; mean {sum(latencies)/len(latencies)*1000:.0f}ms',flush=True)
-        print('Cache invalidation, delayed-result rejection, freshness fallback and recovery passed; no physical LED involved',flush=True)
+        print('Two-hour active run, stale provider rejection, cache invalidation, delayed-result rejection, freshness fallback and recovery passed; no physical LED involved',flush=True)
     finally:
         process.terminate();process.wait(timeout=5);stop.set();thread.join(timeout=3);server.close();db.close();log.close()
