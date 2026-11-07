@@ -76,17 +76,22 @@ final class TimestampParser {
         return (fractional.date(from:text) ?? whole.date(from:text))?.timeIntervalSince1970 ?? 0
     }
 }
-struct Turn { let id: String; let thread: String; let status: String; let started: Double; let completed: Double }
+// Match T3 ThreadManagementService.isActiveRun, independently of the latest request.
+struct TrackedRun {
+    let id: String; let thread: String; let status: String; let started: Double; let completed: Double
+    var isActive: Bool { ["preparing", "starting", "running", "waiting"].contains(status) }
+}
 struct Tracker {
     var active = Set<String>()
     var finished = [String: Double]()
-    mutating func update(_ rows: [Turn], visits: [String: Double], attention: Bool, now: Double, doneDuration: Double = 120, dismissed: Set<String> = []) -> String {
+    mutating func update(_ rows: [TrackedRun], visits: [String: Double], attention: Bool, now: Double, doneDuration: Double = 120, dismissed: Set<String> = []) -> String {
         for row in rows where active.contains(row.id) && row.status == "completed" && row.completed > 0 {
             finished[row.thread] = max(finished[row.thread] ?? 0, row.completed)
         }
-        active = Set(rows.filter { $0.status == "running" && now - $0.started < 3600 }.map(\.id))
+        active = Set(rows.filter(\.isActive).map(\.id))
         finished = finished.filter { thread, completed in
-            let restarted = rows.contains { $0.thread == thread && $0.started > completed }
+            // An overlapping run may have started before this completion.
+            let restarted = rows.contains { $0.thread == thread && ($0.isActive || $0.started > completed) }
             let seen = dismissed.contains(thread) || (visits[thread] ?? 0) >= completed
             return !restarted && !seen && (doneDuration == 0 || now < completed + doneDuration)
         }
@@ -108,7 +113,7 @@ func query(_ db: OpaquePointer, _ sql: String) throws -> [[String]] {
         })
     }
 }
-typealias T3Snapshot = ([Turn], [String:Double], Bool, Set<String>)
+typealias T3Snapshot = ([TrackedRun], [String:Double], Bool, Set<String>)
 func t3DatabasePath()->String {
 #if TESTING
     if let path=ProcessInfo.processInfo.environment["MAGDOT_TEST_DB_PATH"] {return path}
@@ -188,21 +193,25 @@ final class T3Reader {
             result.append((0..<sqlite3_column_count(statement)).map {sqlite3_column_text(statement,$0).map{String(cString:$0)} ?? ""})
         }
     }
-    func read(observedTurns:Set<String>=[],finishedThreads:Set<String>=[]) throws -> T3Snapshot {
+    func read(observedRuns:Set<String>=[],finishedThreads:Set<String>=[]) throws -> T3Snapshot {
         do {
             try connect()
             _ = try rows("BEGIN")
             defer {_ = try? rows("ROLLBACK")}
             let version=try rows("PRAGMA data_version").first?.first ?? ""
             let now=ProcessInfo.processInfo.systemUptime
-            // Keep a bounded superset of recent rows. Tracker still applies time-based
-            // expiry on every tick, including when no database transaction changes.
-            if let cached,version==cachedVersion,observedTurns==cachedObserved,finishedThreads==cachedFinished,now-refreshedAt<30 {return cached}
-            let observed=observedTurns.sorted()
+            // Cache lifecycle rows; Tracker still applies Done expiry on every tick.
+            // Active runs have no elapsed-time limit. Committed changes invalidate this cache.
+            if let cached,version==cachedVersion,observedRuns==cachedObserved,finishedThreads==cachedFinished,now-refreshedAt<30 {return cached}
+            let observed=observedRuns.sorted()
             let marks=observed.isEmpty ? "NULL":Array(repeating:"?",count:observed.count).joined(separator:",")
-            let turns=try rows("SELECT p.provider_turn_id,p.thread_id,p.status,p.started_at,p.completed_at FROM orchestration_v2_projection_provider_turns p JOIN orchestration_v2_projection_threads t USING(thread_id) WHERE t.deleted_at IS NULL AND t.archived_at IS NULL AND \(eligibleThread) AND (p.provider_turn_id IN (\(marks)) OR p.status='running' OR p.completed_at > strftime('%Y-%m-%dT%H:%M:%fZ','now','-130 seconds'))",observed)
+            // Read runs, not provider turns: provider completion can precede parent-run
+            // completion, and stale provider records can outlive cancelled/failed runs.
+            // Never select only the latest ordinal: a newer request can be queued/cancelled.
+            // Missing startedAt is not a start: cancelled queued requests must retain unread Done.
+            let runs=try rows("SELECT r.run_id,r.thread_id,r.status,json_extract(r.payload_json,'$.startedAt'),r.completed_at FROM orchestration_v2_projection_runs r JOIN orchestration_v2_projection_threads t USING(thread_id) WHERE t.deleted_at IS NULL AND t.archived_at IS NULL AND \(eligibleThread) AND (r.run_id IN (\(marks)) OR r.status IN ('preparing','starting','running','waiting') OR r.completed_at > strftime('%Y-%m-%dT%H:%M:%fZ','now','-130 seconds'))",observed)
             // A completion observed on this poll must be dismissible on this poll too.
-            let relevant=finishedThreads.union(turns.filter {observedTurns.contains($0[0]) && $0[2]=="completed"}.map{$0[1]}).sorted()
+            let relevant=finishedThreads.union(runs.filter {observedRuns.contains($0[0]) && $0[2]=="completed"}.map{$0[1]}).sorted()
             var visits=[String:Double]()
             var dismissed=Set<String>()
             if !relevant.isEmpty {
@@ -210,7 +219,7 @@ final class T3Reader {
                 let result=try rows("SELECT thread_id,json_extract(payload_json,'$.lastVisitedAt'),json_extract(payload_json,'$.snoozedUntil'),archived_at,deleted_at,json_extract(payload_json,'$.settledOverride') FROM orchestration_v2_projection_threads t WHERE thread_id IN (\(marks)) AND \(eligibleThread)",relevant)
                 visitRowsRead+=result.count
                 // Missing or excluded threads dismiss pending Done too. Fetch only relevant completions,
-                // including pending ones whose turn rows are no longer returned.
+                // including pending ones whose run rows are no longer returned.
                 dismissed=Set(relevant).subtracting(result.map{$0[0]})
                 let wallNow=Date().timeIntervalSince1970
                 for row in result {
@@ -219,13 +228,13 @@ final class T3Reader {
                 }
             }
             let requests=try rows("SELECT EXISTS(SELECT 1 FROM orchestration_v2_projection_runtime_requests r JOIN orchestration_v2_projection_threads t USING(thread_id) WHERE r.resolved_at IS NULL AND r.status NOT IN ('resolved','cancelled','failed','expired') AND r.kind IN ('user_input','approval','permission') AND t.archived_at IS NULL AND t.deleted_at IS NULL AND \(eligibleThread))")
-            let result:T3Snapshot=(turns.map {Turn(id:$0[0],thread:$0[1],status:$0[2],started:parser.parse($0[3]),completed:parser.parse($0[4]))},visits,requests.first?.first=="1",dismissed)
-            cached=result;cachedVersion=version;cachedObserved=observedTurns;cachedFinished=finishedThreads;refreshedAt=now;refreshCount+=1
+            let result:T3Snapshot=(runs.map {TrackedRun(id:$0[0],thread:$0[1],status:$0[2],started:parser.parse($0[3]),completed:parser.parse($0[4]))},visits,requests.first?.first=="1",dismissed)
+            cached=result;cachedVersion=version;cachedObserved=observedRuns;cachedFinished=finishedThreads;refreshedAt=now;refreshCount+=1
             return result
         } catch {close();throw error}
     }
 }
-func readT3(observedTurns:Set<String>=[]) throws -> T3Snapshot {try T3Reader().read(observedTurns:observedTurns)}
+func readT3(observedRuns:Set<String>=[]) throws -> T3Snapshot {try T3Reader().read(observedRuns:observedRuns)}
 func shellQuote(_ value: String) -> String { "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'" }
 func appleQuote(_ value: String) -> String { "\"" + value.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"") + "\"" }
 
@@ -986,7 +995,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let delayText=environment["MAGDOT_TEST_POLL_DELAY_FILE"].flatMap {try? String(contentsOfFile:$0,encoding:.utf8)} ?? environment["MAGDOT_TEST_POLL_DELAY"]
             if let delay=delayText.flatMap(Double.init),delay>0 {Thread.sleep(forTimeInterval:delay)}
 #endif
-            let result=Result {try self.reader.read(observedTurns:observed,finishedThreads:finished)}
+            let result=Result {try self.reader.read(observedRuns:observed,finishedThreads:finished)}
             RunLoop.main.perform(inModes:[.common]) { [weak self] in
                 guard let self,self.pollGeneration==generation,self.pollInFlight==generation else{return}
                 self.pollInFlight=nil
@@ -995,7 +1004,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 case .success(let (rows,visits,attention,dismissed)):
                     guard self.freshness.confirm(startedAt:startedAt,now:ProcessInfo.processInfo.systemUptime) else {
                         // Do not mutate Tracker with an obsolete snapshot. The
-                        // next poll still observes its outstanding turn IDs.
+                        // next poll still observes its outstanding run IDs.
                         self.latestMode="system"
                         if self.testState==nil && self.lastSentMode != "system" {
                             if !self.sendState("system") {self.ended(false);return}
@@ -1176,8 +1185,8 @@ if CommandLine.arguments.contains("--self-test") {
     precondition(gate.observe(true) && gate.pendingStart)
     print("Connection gating, reconnect, manual stop, unknown state, and icon visibility passed")
     var tracker = Tracker()
-    let running = Turn(id: "a", thread: "chat", status: "running", started: 100, completed: 0)
-    let done = Turn(id: "a", thread: "chat", status: "completed", started: 100, completed: 110)
+    let running = TrackedRun(id: "a", thread: "chat", status: "running", started: 100, completed: 0)
+    let done = TrackedRun(id: "a", thread: "chat", status: "completed", started: 100, completed: 110)
     precondition(tracker.update([running], visits: [:], attention: false, now: 105) == "working")
     precondition(tracker.update([running], visits: [:], attention: true, now: 106) == "attention")
     precondition(tracker.update([done], visits: [:], attention: false, now: 111) == "finished")
@@ -1188,9 +1197,9 @@ if CommandLine.arguments.contains("--self-test") {
     var fresh = Tracker()
     precondition(fresh.update([done], visits: [:], attention: false, now: 111) == "idle")
     _ = fresh.update([running], visits: [:], attention: false, now: 105)
-    let cancelled = Turn(id: "a", thread: "chat", status: "cancelled", started: 100, completed: 110)
+    let cancelled = TrackedRun(id: "a", thread: "chat", status: "cancelled", started: 100, completed: 110)
     precondition(fresh.update([cancelled], visits: [:], attention: false, now: 111) == "idle")
-    precondition(fresh.update([running], visits: [:], attention: false, now: 3701) == "idle")
+    precondition(fresh.update([running], visits: [:], attention: false, now: 3701) == "working")
     for duration in [60.0,180,300,600,1200] {
         var timed=Tracker()
         _ = timed.update([running],visits:[:],attention:false,now:105,doneDuration:duration)
@@ -1198,7 +1207,7 @@ if CommandLine.arguments.contains("--self-test") {
         precondition(timed.update([done],visits:[:],attention:false,now:110+duration,doneDuration:duration)=="idle")
     }
     var multiple=Tracker()
-    let second=Turn(id:"b",thread:"other",status:"running",started:100,completed:0)
+    let second=TrackedRun(id:"b",thread:"other",status:"running",started:100,completed:0)
     _ = multiple.update([running,second],visits:[:],attention:false,now:105,doneDuration:0)
     precondition(multiple.update([done,second],visits:[:],attention:false,now:111,doneDuration:0)=="finished")
     precondition(multiple.update([done,second],visits:[:],attention:true,now:112,doneDuration:0)=="attention")
@@ -1231,7 +1240,7 @@ if CommandLine.arguments.contains("--self-test") {
     // Unsettling does not replay the acknowledged completion.
     precondition(settled.update([done,second], visits:[:], attention:false, now:113, doneDuration:0)=="working")
     var pending = Tracker()
-    let otherDone = Turn(id:"b",thread:"other",status:"completed",started:100,completed:110)
+    let otherDone = TrackedRun(id:"b",thread:"other",status:"completed",started:100,completed:110)
     _ = pending.update([running,second], visits:[:], attention:false, now:105)
     precondition(pending.update([done,otherDone], visits:[:], attention:false, now:111, doneDuration:0)=="finished")
     precondition(pending.update([], visits:[:], attention:false, now:112, doneDuration:0, dismissed:["chat"])=="finished")
@@ -1248,7 +1257,7 @@ if CommandLine.arguments.contains("--self-test") {
     precondition(SequencePreference.load("working",defaults:testDefaults).preset==3)
     testDefaults.removeObject(forKey:"sequence.working")
     print("Sequence persistence and invalid preference fallback passed")
-    print("Native lifecycle tests passed: working, attention, completion, expiry, visit, startup, cancellation, stale turn")
+    print("Native lifecycle tests passed: working, attention, completion, expiry, visit, startup, cancellation, long-running work")
 } else if CommandLine.arguments.contains("--connection-status") {
     print(magSafeConnection().map {$0 ? "connected":"disconnected"} ?? "unknown")
 } else if CommandLine.arguments.contains("--unregister-helper") {
@@ -1257,7 +1266,7 @@ if CommandLine.arguments.contains("--self-test") {
 } else if CommandLine.arguments.contains("--service-status") {
     print("Helper service status: \(SMAppService.daemon(plistName: "com.maximkich.magdot.helper.plist").status.rawValue)")
 } else if CommandLine.arguments.contains("--probe-t3") {
-    do { let (rows, _, attention, dismissed) = try readT3(); print("T3 read succeeded: \(rows.count) recent/running turns; attention=\(attention); snoozed/settled/archived/deleted=\(dismissed.count)") }
+    do { let (rows, _, attention, dismissed) = try readT3(); print("T3 read succeeded: \(rows.count) recent/active runs; attention=\(attention); snoozed/settled/archived/deleted=\(dismissed.count)") }
     catch { print("T3 unavailable"); exit(1) }
 } else {
     let app = NSApplication.shared
