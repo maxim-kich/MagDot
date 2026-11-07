@@ -99,6 +99,55 @@ for dismissal in ["read","snooze","settle","archive","delete","remove"] {
     check(Set(pending.finished.keys)==["b"],"\(dismissal) does not replay when cleared")
 }
 print("Read/snooze/settle/archive/delete cache invalidation, independent dismissal, and no replay passed")
+// Subagents must never contribute Working, Done or Input, even when observed
+// before their lineage arrived. Keep normal forks and legacy metadata eligible.
+try exec("DELETE FROM orchestration_v2_projection_runtime_requests")
+try exec("DELETE FROM orchestration_v2_projection_provider_turns")
+try exec("DELETE FROM orchestration_v2_projection_threads")
+try exec("INSERT INTO orchestration_v2_projection_threads VALUES('parent','{}',NULL,NULL),('child','{\"lineage\":{\"parentThreadId\":\"parent\",\"relationshipToParent\":\"subagent\"}}',NULL,NULL),('nested','{\"lineage\":{\"parentThreadId\":\"child\",\"relationshipToParent\":\"subagent\"}}',NULL,NULL)")
+try exec("INSERT INTO orchestration_v2_projection_provider_turns VALUES('parent-turn','parent','running','2026-11-02T00:00:00Z',NULL),('child-turn','child','running','2026-11-02T00:00:00Z',NULL),('nested-turn','nested','running','2026-11-02T00:00:00Z',NULL)")
+var parentTracker=Tracker()
+snapshot=try reader.read()
+check(Set(snapshot.0.map(\.thread))==["parent"],"running subagents excluded")
+check(parentTracker.update(snapshot.0,visits:snapshot.1,attention:snapshot.2,now:date,dismissed:snapshot.3)=="working","parent remains Working")
+try exec("UPDATE orchestration_v2_projection_provider_turns SET status='completed',completed_at='2026-11-02T00:00:01Z' WHERE thread_id!='parent'")
+// Pass child IDs deliberately to exercise the observed-turn query path too.
+snapshot=try reader.read(observedTurns:["parent-turn","child-turn","nested-turn"])
+check(Set(snapshot.0.map(\.thread))==["parent"],"observed child completions excluded")
+check(parentTracker.update(snapshot.0,visits:snapshot.1,attention:snapshot.2,now:date+2,doneDuration:0,dismissed:snapshot.3)=="working","child Done cannot override Working parent")
+for kind in ["user_input","approval","permission"] {
+    try exec("INSERT INTO orchestration_v2_projection_runtime_requests VALUES('child',NULL,'pending','\(kind)')")
+    check(!(try reader.read().2),"subagent \(kind) cannot trigger Input")
+}
+try exec("DELETE FROM orchestration_v2_projection_provider_turns WHERE thread_id='parent'")
+snapshot=try reader.read()
+check(parentTracker.update(snapshot.0,visits:snapshot.1,attention:snapshot.2,now:date+3,dismissed:snapshot.3)=="idle","subagents alone leave MagDot idle")
+// Late lineage must invalidate cached rows and dismiss an already-pending Done.
+try exec("UPDATE orchestration_v2_projection_threads SET payload_json='{}' WHERE thread_id='child'")
+try exec("UPDATE orchestration_v2_projection_provider_turns SET status='running',completed_at=NULL WHERE thread_id='child'")
+snapshot=try reader.read()
+var lateTracker=Tracker()
+_ = lateTracker.update(snapshot.0,visits:snapshot.1,attention:false,now:date)
+try exec("UPDATE orchestration_v2_projection_provider_turns SET status='completed',completed_at='2026-11-02T00:00:01Z' WHERE thread_id='child'")
+snapshot=try reader.read(observedTurns:lateTracker.active)
+check(lateTracker.update(snapshot.0,visits:snapshot.1,attention:false,now:date+2,doneDuration:0,dismissed:snapshot.3)=="finished","legacy thread completion still triggers Done")
+_ = try reader.read(finishedThreads:["child"])
+try exec("UPDATE orchestration_v2_projection_threads SET payload_json='{\"lineage\":{\"relationshipToParent\":\"subagent\"}}' WHERE thread_id='child'")
+snapshot=try reader.read(finishedThreads:["child"])
+check(snapshot.3.contains("child"),"late subagent lineage dismisses pending Done on next poll")
+check(lateTracker.update(snapshot.0,visits:snapshot.1,attention:snapshot.2,now:date+3,doneDuration:0,dismissed:snapshot.3)=="idle","pending subagent Done cleared")
+for metadata in ["{}", "{\"lineage\":null}", "{\"lineage\":{\"parentThreadId\":null,\"relationshipToParent\":null}}", "{\"lineage\":{\"parentThreadId\":\"parent\",\"relationshipToParent\":\"fork\"}}"] {
+    try exec("UPDATE orchestration_v2_projection_threads SET payload_json='\(metadata)' WHERE thread_id='child'")
+    try exec("UPDATE orchestration_v2_projection_provider_turns SET status='running',completed_at=NULL WHERE thread_id='child'")
+    snapshot=try reader.read()
+    check(Set(snapshot.0.map(\.thread))==["child"] && snapshot.2,"ordinary fork/null/missing lineage retains Working and Input")
+    var ordinary=Tracker()
+    _ = ordinary.update(snapshot.0,visits:snapshot.1,attention:false,now:date)
+    try exec("UPDATE orchestration_v2_projection_provider_turns SET status='completed',completed_at='2026-11-02T00:00:01Z' WHERE thread_id='child'")
+    snapshot=try reader.read(observedTurns:ordinary.active)
+    check(ordinary.update(snapshot.0,visits:snapshot.1,attention:false,now:date+2,doneDuration:0,dismissed:snapshot.3)=="finished","ordinary fork/null/missing lineage retains Done")
+}
+print("Subagent Working/Done/Input exclusion, nested children, late lineage and ordinary forks passed")
 try exec("DROP TABLE orchestration_v2_projection_runtime_requests")
 do {_ = try reader.read();preconditionFailure("schema failure must surface")}catch{}
 try exec("CREATE TABLE orchestration_v2_projection_runtime_requests(thread_id TEXT,resolved_at TEXT,status TEXT,kind TEXT)")
@@ -123,6 +172,8 @@ sqlite3_close(changed)
 check(try reader.read().2,"inode replacement invalidates live cache")
 reader.close()
 print("Timestamp formats, unchanged cache, concurrent writes, bounded visits, same-poll acknowledgment, schema errors and file replacement passed")
+
+if CommandLine.arguments.contains("--reader-only") { exit(0) }
 
 // Real AppKit lifecycle checks; no App delegate or helper/SMC is started.
 let application=NSApplication.shared

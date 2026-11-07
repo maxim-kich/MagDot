@@ -10,4 +10,4 @@ Path('build/efficiency/main.swift').write_text(source+Path('tests/efficiency/che
 PY
 FRAMEWORKS="$PWD/build/sparkle/Sparkle.xcframework/macos-arm64_x86_64"
 xcrun swiftc -D TESTING -swift-version 5 -O build/efficiency/main.swift app/UpdateChecker.swift app/InAppUpdater.swift -F "$FRAMEWORKS" -framework Sparkle -Xlinker -rpath -Xlinker "$FRAMEWORKS" -framework AppKit -framework ServiceManagement -lsqlite3 -o build/efficiency/checks
-build/efficiency/checks
+build/efficiency/checks "$@"
