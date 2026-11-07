@@ -132,6 +132,9 @@ struct LEDFreshness {
 }
 // Confined to one queue. The database and its indexes are never modified.
 final class T3Reader {
+    // T3 exposes provider-created subagents alongside user threads. Only the
+    // parent thread should contribute status; ordinary forks remain eligible.
+    private let eligibleThread = "COALESCE(json_extract(t.payload_json,'$.lineage.relationshipToParent'),'') != 'subagent'"
     let path:String
     private var db:OpaquePointer?
     private var identity:String?
@@ -197,16 +200,16 @@ final class T3Reader {
             if let cached,version==cachedVersion,observedTurns==cachedObserved,finishedThreads==cachedFinished,now-refreshedAt<30 {return cached}
             let observed=observedTurns.sorted()
             let marks=observed.isEmpty ? "NULL":Array(repeating:"?",count:observed.count).joined(separator:",")
-            let turns=try rows("SELECT p.provider_turn_id,p.thread_id,p.status,p.started_at,p.completed_at FROM orchestration_v2_projection_provider_turns p JOIN orchestration_v2_projection_threads t USING(thread_id) WHERE t.deleted_at IS NULL AND t.archived_at IS NULL AND (p.provider_turn_id IN (\(marks)) OR p.status='running' OR p.completed_at > strftime('%Y-%m-%dT%H:%M:%fZ','now','-130 seconds'))",observed)
+            let turns=try rows("SELECT p.provider_turn_id,p.thread_id,p.status,p.started_at,p.completed_at FROM orchestration_v2_projection_provider_turns p JOIN orchestration_v2_projection_threads t USING(thread_id) WHERE t.deleted_at IS NULL AND t.archived_at IS NULL AND \(eligibleThread) AND (p.provider_turn_id IN (\(marks)) OR p.status='running' OR p.completed_at > strftime('%Y-%m-%dT%H:%M:%fZ','now','-130 seconds'))",observed)
             // A completion observed on this poll must be dismissible on this poll too.
             let relevant=finishedThreads.union(turns.filter {observedTurns.contains($0[0]) && $0[2]=="completed"}.map{$0[1]}).sorted()
             var visits=[String:Double]()
             var dismissed=Set<String>()
             if !relevant.isEmpty {
                 let marks=Array(repeating:"?",count:relevant.count).joined(separator:",")
-                let result=try rows("SELECT thread_id,json_extract(payload_json,'$.lastVisitedAt'),json_extract(payload_json,'$.snoozedUntil'),archived_at,deleted_at,json_extract(payload_json,'$.settledOverride') FROM orchestration_v2_projection_threads WHERE thread_id IN (\(marks))",relevant)
+                let result=try rows("SELECT thread_id,json_extract(payload_json,'$.lastVisitedAt'),json_extract(payload_json,'$.snoozedUntil'),archived_at,deleted_at,json_extract(payload_json,'$.settledOverride') FROM orchestration_v2_projection_threads t WHERE thread_id IN (\(marks)) AND \(eligibleThread)",relevant)
                 visitRowsRead+=result.count
-                // Missing threads are deleted too. Fetch only relevant completions,
+                // Missing or excluded threads dismiss pending Done too. Fetch only relevant completions,
                 // including pending ones whose turn rows are no longer returned.
                 dismissed=Set(relevant).subtracting(result.map{$0[0]})
                 let wallNow=Date().timeIntervalSince1970
@@ -215,7 +218,7 @@ final class T3Reader {
                     if parser.parse(row[2])>wallNow || !row[3].isEmpty || !row[4].isEmpty || row[5]=="settled" {dismissed.insert(row[0])}
                 }
             }
-            let requests=try rows("SELECT EXISTS(SELECT 1 FROM orchestration_v2_projection_runtime_requests r JOIN orchestration_v2_projection_threads t USING(thread_id) WHERE r.resolved_at IS NULL AND r.status NOT IN ('resolved','cancelled','failed','expired') AND r.kind IN ('user_input','approval','permission') AND t.archived_at IS NULL AND t.deleted_at IS NULL)")
+            let requests=try rows("SELECT EXISTS(SELECT 1 FROM orchestration_v2_projection_runtime_requests r JOIN orchestration_v2_projection_threads t USING(thread_id) WHERE r.resolved_at IS NULL AND r.status NOT IN ('resolved','cancelled','failed','expired') AND r.kind IN ('user_input','approval','permission') AND t.archived_at IS NULL AND t.deleted_at IS NULL AND \(eligibleThread))")
             let result:T3Snapshot=(turns.map {Turn(id:$0[0],thread:$0[1],status:$0[2],started:parser.parse($0[3]),completed:parser.parse($0[4]))},visits,requests.first?.first=="1",dismissed)
             cached=result;cachedVersion=version;cachedObserved=observedTurns;cachedFinished=finishedThreads;refreshedAt=now;refreshCount+=1
             return result
