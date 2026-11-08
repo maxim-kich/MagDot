@@ -84,3 +84,66 @@ app.checkConnection()
 check(app.requested && !app.ready,"approval resumes requested activation without claiming helper readiness")
 app.ended(true)
 print("Permission and window routing fixtures passed")
+
+// Update preparation waits for the production stop completion before unregistration.
+let updating=App()
+updating.startItem=NSMenuItem();updating.stopItem=NSMenuItem()
+var unregisters=0
+updating.testUnregisterHelper={unregisters+=1}
+var result:Bool?
+updating.requested=true;updating.stopping=true;updating.ready=true
+updating.prepareUpdateRestart(stillAuthorized:{true}) {result=$0}
+check(result == nil && unregisters == 0,"update waits for restoration before unregister")
+updating.ended(true)
+check(result == true && unregisters == 1,"restoration acknowledgement permits unregister")
+result=nil
+updating.requested=true;updating.stopping=true
+updating.prepareUpdateRestart(stillAuthorized:{true}) {result=$0}
+updating.ended(false)
+check(result == false && unregisters == 1,"restoration failure prevents unregister")
+result=nil
+updating.prepareUpdateRestart(stillAuthorized:{true}) {result=$0}
+check(result == false && unregisters == 1,"retry cannot bypass failed restoration using temporary OFF")
+updating.updateRestorationFailed=false
+updating.requested=true;updating.stopping=true;result=nil
+var authorized=true
+updating.prepareUpdateRestart(stillAuthorized:{authorized}) {result=$0}
+authorized=false
+updating.ended(true)
+check(result == false && unregisters == 1,"late stop after cancellation never unregisters")
+updating.testUnregisterHelper={throw NSError(domain:"fixture",code:2)}
+result=nil
+updating.prepareUpdateRestart(stillAuthorized:{true}) {result=$0}
+check(result == false,"unregistration failure prevents install")
+print("Updater stop acknowledgement fixtures passed")
+
+let resumed=App()
+resumed.startItem=NSMenuItem();resumed.stopItem=NSMenuItem()
+resumed.testOnboardingRequired=false
+resumed.testHelperStatus = .requiresApproval
+setenv("MAGDOT_TEST_CONNECTION_FILE",connectionFile.path,1)
+try "disconnected".write(to:connectionFile,atomically:true,encoding:.utf8)
+resumed.resumeAfterUpdate(true)
+let resumedSettings=resumed.settingsWindow
+check(resumed.connectionGate.activationEnabled && !resumed.requested && !resumed.ready && !resumed.connectorView.isActive,"ON receipt unplugged retains intent without claiming control")
+check(resumedSettings?.navigation.selectedRow == 2,"update opens Settings About")
+try "connected".write(to:connectionFile,atomically:true,encoding:.utf8)
+resumed.checkConnection()
+check(resumed.requested && !resumed.ready && !resumed.connectorView.isActive,"ON reconnect waits for approval and READY")
+resumed.ended(true)
+resumed.resumeAfterUpdate(false)
+check(resumed.settingsWindow === resumedSettings && resumedSettings?.navigation.selectedRow == 2,"update reuses Settings controller on About")
+resumed.testHelperStatus = .enabled
+resumed.observedHelperApproval=false
+resumed.checkConnection()
+check(!resumed.requested && !resumed.connectionGate.activationEnabled && !resumed.connectorView.isActive,"OFF receipt remains OFF even after approval")
+unsetenv("MAGDOT_TEST_CONNECTION_FILE")
+resumedSettings?.close()
+print("Updater resume and About routing fixtures passed")
+
+updating.testUnregisterHelper={unregisters+=1}
+updating.connectionGate.activationEnabled=true
+updating.connectionGate.pendingStart=true
+result=nil
+updating.prepareUpdateRestart(stillAuthorized:{true}) {result=$0}
+check(result == true && !updating.connectionGate.activationEnabled && !updating.connectionGate.pendingStart,"update disables deferred ON intent even without a running session")

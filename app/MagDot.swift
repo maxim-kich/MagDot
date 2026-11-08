@@ -677,6 +677,11 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var stopping = false, quitting = false, requested = false, ready = false, restored = false
     var socketFD: Int32 = -1, lockFD: Int32 = -1
     var startedAt = Date(), stopAt = Date()
+    #if TESTING
+    var testUnregisterHelper:(() throws -> Void)?
+    #endif
+    var updateStopCompletion:((Bool)->Void)?
+    var updateRestorationFailed=false
     var activationError:String?
     var activationOn:Bool {requested && !stopping}
     var activationDetail:String {
@@ -757,8 +762,11 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let quit = NSMenuItem(title: "Quit MagDot", action: #selector(quit), keyEquivalent: "q"); quit.target = self; menu.addItem(quit)
         item.menu = menu
         _ = NotificationCenter.default.addObserver(forName:Notification.Name("MagDotShowAbout"),object:nil,queue:.main){[weak self] _ in self?.showSettings();self?.settingsWindow?.navigation.selectRowIndexes(IndexSet(integer:2),byExtendingSelection:false)}
-        UpdateChecker.shared.activity={ [weak self] in UpdateActivity(controllingLED:self?.requested != false) }
-        UpdateChecker.shared.beforeRestart={ [weak self] in guard let self else{return};try self.service.unregister() }
+        UpdateChecker.shared.activity={ [weak self] in UpdateActivity(controllingLED:self?.requested != false || self?.stopping != false, activationIntent:self?.connectionGate.activationEnabled == true) }
+        UpdateChecker.shared.beforeRestart={ [weak self] stillAuthorized, completion in
+            guard let self else {completion(false);return}
+            self.prepareUpdateRestart(stillAuthorized:stillAuthorized, completion)
+        }
         #if !TESTING
         #endif
         if CommandLine.arguments.contains("--settings") || CommandLine.arguments.contains("--render-settings") {showSettings()}
@@ -784,7 +792,8 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 } catch { NSLog("MagDot launch-at-login registration failed: %@",error.localizedDescription) }
             }
 #endif
-            checkConnection()
+            let updateIntent=UpdateRelaunch.consume()
+            if let updateIntent {resumeAfterUpdate(updateIntent)} else {checkConnection()}
             connectionTimer=Timer(timeInterval:1,repeats:true){[weak self] _ in self?.checkConnection()}
             connectionTimer?.tolerance=0.2
             RunLoop.main.add(connectionTimer!,forMode:.common)
@@ -890,6 +899,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc func toggleFromMenu(){if menuSwitch.state == .on {start()} else {stop()};updateActivationStatus()}
     func applicationShouldHandleReopen(_ sender:NSApplication,hasVisibleWindows flag:Bool)->Bool {showSettings();return true}
     @objc func start() {
+        guard !UpdateChecker.shared.restartInProgress else {return}
         guard !activationOn else {updateActivationStatus();return}
         activationError=nil
         connectionGate.activationEnabled=true
@@ -950,7 +960,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let count = recv(socketFD, &buffer, buffer.count, MSG_DONTWAIT)
         if count > 0 {
             received += String(decoding: buffer.prefix(count), as: UTF8.self)
-            if received.contains("READY\n") && !stopping && !ready { ready = true; awaitingHelperApproval=false;connectorView.isActive=true;updateActivationStatus() }
+            if received.contains("READY\n") && !stopping && !ready { updateRestorationFailed=false; ready = true; awaitingHelperApproval=false;connectorView.isActive=true;updateActivationStatus() }
             if received.contains("RESTORED\n") { restored = true }
             if received.count > 4096 { received = String(received.suffix(4096)) }
         } else if count == 0 { ended(restored && stopping); return }
@@ -1059,6 +1069,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         updateActivationStatus()
     }
     func ended(_ success: Bool, message: String? = nil) {
+        if !success {updateRestorationFailed=true}
         let wasReady=ready, wasStopping=stopping
         let failed = !success
         if failed {
@@ -1076,12 +1087,43 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         status.title = activationError ?? message ?? "Stopped"
         updateActivationStatus()
         startItem.isEnabled = true; stopItem.isEnabled = false
+        let completion=updateStopCompletion;updateStopCompletion=nil
+        completion?(success)
         if CommandLine.arguments.contains("--smoke-test") {
             print("App Stop completed; restoration acknowledged=\(success)"); NSApp.terminate(nil)
         }
         if CommandLine.arguments.contains("--quit-smoke") && !quitting { print("Start failed: \(status.title)"); exit(1) }
         if !quitting && !sleeping && sleepTracker != nil { didWake() }
         if quitting { print("Quit restoration acknowledged=\(success)"); NSApp.reply(toApplicationShouldTerminate: true) }
+    }
+    func resumeAfterUpdate(_ intent:Bool) {
+        connectionGate.activationEnabled=intent
+        checkConnection()
+        // start() retains the existing connection, approval, and READY gates.
+        // Do not restore Tracker state or replay pending completions.
+        if intent && !requested && connectionGate.canRun {start()}
+        showSettings()
+        settingsWindow?.navigation.selectRowIndexes(IndexSet(integer:2),byExtendingSelection:false)
+    }
+    func prepareUpdateRestart(stillAuthorized:@escaping ()->Bool, _ completion:@escaping (Bool)->Void) {
+        guard updateStopCompletion == nil, !updateRestorationFailed, !quitting else {completion(false);return}
+        let finish:(Bool)->Void = { [weak self] success in
+            guard let self, success else {completion(false);return}
+            // A cancelled stop must never unregister the helper later.
+            guard stillAuthorized() else {completion(false);return}
+            do {
+#if TESTING
+                try self.testUnregisterHelper?()
+#else
+                if self.helperStatus != .notRegistered && self.helperStatus != .notFound {try self.service.unregister()}
+#endif
+                completion(true)
+            } catch {completion(false)}
+        }
+        if requested || stopping {
+            updateStopCompletion=finish
+            if !stopping {stop()}
+        } else {stop();finish(true)}
     }
     func manageHelperPermission() {
         activationError=nil
